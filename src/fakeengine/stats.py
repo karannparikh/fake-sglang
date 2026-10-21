@@ -47,14 +47,16 @@ class MetricsPusher:
             self._task = asyncio.get_running_loop().create_task(self._run())
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+        finally:
             self._task = None
-        self._close()
+            self._close()
 
     async def _run(self) -> None:
         try:

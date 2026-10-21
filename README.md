@@ -41,6 +41,8 @@ SGLang and never knows the difference.
 - **Forward-pass metrics (FPM)** — simulated scheduled/queued token counts,
   batch sizes, variances and pass durations, relayed through real Dynamo.
   Idle heartbeats clear stale load so the Planner can scale down.
+- **Packed DP ranks** — independent schedulers, KV caches, and telemetry for
+  multiple logical workers in one CPU process, with rank-aware routing.
 
 Aggregated and disaggregated modes produce **byte-identical output** for the
 same prompt, and both are reproducible run to run.
@@ -64,10 +66,33 @@ without counting another cache observation.
 
 `--enable-forward-pass-metrics` requires Dynamo's injected
 `--forward-pass-metrics-ipc-name` and `--forward-pass-metrics-worker-id`.
-The publisher binds `<ipc-name>.0` and emits SGLang-compatible multipart
+Each rank's publisher binds `<ipc-name>.<rank>` and emits SGLang-compatible multipart
 ZMQ messages, including idle heartbeats. Durations are simulated, not measured
-GPU execution. Engine FPM currently requires `--dp-size 1`; packed-DP
-execution is not implemented in this stage.
+GPU execution.
+
+### Packed workers
+
+`--dp-size N --enable-dp-attention` packs N independent simulated DP ranks
+into one process. This requires a generation model, `--nnodes 1` and
+`--node-rank 0`; it does not execute real TP or distributed collectives.
+Each rank owns its scheduler, prefix cache, counters, KV-event publisher,
+FPM endpoint, and scheduler-metrics stream. Prometheus observations carry
+the `dp_rank` label. KV events use the configured TCP port plus the rank;
+scheduler metrics share Dynamo's IPC endpoint and carry `data_parallel_rank`.
+
+KV capacity and the prefill budget are **per rank**. An explicit
+`--max-running-requests` is a process-wide budget, must be positive and
+divisible by `dp_size`, and is split equally; when omitted it defaults to
+256 slots per rank. For example, `--dp-size 10 --max-running-requests 80
+--fake-num-kv-blocks 8192 --page-size 16` gives each rank 131,072 KV token
+slots and eight running-request slots.
+
+`routed_dp_rank` selects a rank; the deprecated `data_parallel_rank` alias
+still works with a warning, and the primary spelling takes precedence.
+Requests without a rank use round-robin assignment. Invalid rank types or
+out-of-range ranks fail instead of being silently rerouted. Cache reuse is
+isolated by both rank and `cache_salt`; `--disable-radix-cache` disables reuse
+on every rank. Abort and cache-flush controls cover all ranks.
 
 ## Setup
 
@@ -408,10 +433,8 @@ past the shim.
 
 ## Not simulated yet
 
-- **Multi-rank KV events.** One DP rank per worker. The per-rank port offset is
-  implemented, but nothing drives `dp_size > 1`.
-- **Multi-rank FPM.** Engine publication currently supports one DP rank per
-  worker; enabling it with `dp_size > 1` raises an explicit error.
+- **Real multi-process/GPU execution.** Packed DP ranks are independent
+  CPU simulations in one process, not TP shards or distributed collectives.
 - **Gateway mode (`--gateway-workers`)**: see Known gaps above.
 - Multimodal, embedding/rerank, diffusion, LoRA, and weight updates — these
   raise a clear `NotImplementedError` rather than pretending.
