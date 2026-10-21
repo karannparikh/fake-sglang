@@ -38,9 +38,36 @@ SGLang and never knows the difference.
   routes on cache hits.
 - **Scheduler metrics** — pushed over ZMQ to the socket Dynamo binds, so
   load-based routing sees real occupancy.
+- **Forward-pass metrics (FPM)** — simulated scheduled/queued token counts,
+  batch sizes, variances and pass durations, relayed through real Dynamo.
+  Idle heartbeats clear stale load so the Planner can scale down.
 
 Aggregated and disaggregated modes produce **byte-identical output** for the
 same prompt, and both are reproducible run to run.
+
+### Observed cache and forward-pass telemetry
+
+With `--enable-metrics`, the engine exports
+`sglang:simulated_prefix_cache_` metrics through Dynamo's SGLang Prometheus
+callback: query/hit token counters, a per-request hit-ratio histogram, and
+capacity, resident, allocated and evictable token gauges. Pressure evictions
+and explicit cache clears have separate counters. Cache observations count
+only initial successful prefill admissions, excluding transferred KV,
+no-peer warmups, retries and preemption re-admissions. They report actual
+local reuse, not router predictions, even when KV-event publication is off.
+Scheduler metrics also report the cumulative observed token hit rate.
+
+`sglang:simulated_kv_generation_seconds_total` accumulates modeled
+uncached-prefill K/V-generation time after speedup scaling, excluding no-peer
+warmups. Recomputed tokens after preemption incur generation time again,
+without counting another cache observation.
+
+`--enable-forward-pass-metrics` requires Dynamo's injected
+`--forward-pass-metrics-ipc-name` and `--forward-pass-metrics-worker-id`.
+The publisher binds `<ipc-name>.0` and emits SGLang-compatible multipart
+ZMQ messages, including idle heartbeats. Durations are simulated, not measured
+GPU execution. Engine FPM currently requires `--dp-size 1`; packed-DP
+execution is not implemented in this stage.
 
 ## Setup
 
@@ -344,7 +371,7 @@ Dynamo a stub `torch`. Any real call into the stub raises an error. Set
 ## Tests
 
 ```bash
-pytest tests/                                                    # 85 tests
+pytest tests/
 pytest ../dynamo/components/src/dynamo/sglang/tests -m unit      # 1006 pass, 7 fail (below)
 ```
 
@@ -357,7 +384,9 @@ and fails by name when Dynamo starts using something the shim lacks: every
 off the class (private names included, since a class-level read breaks import
 of the whole worker), and every `envs.SGLANG_*` field, which must have
 SGLang's type. It understands Dynamo's `_compat.py` N/N-1 fallback groups,
-requiring only that *one* alternative in each group resolves. Groups the shim
+requiring only that *one* alternative in each required group resolves.
+Explicit None/no-op import-error fallbacks permit an import to be absent.
+Parser regressions run even without Dynamo's source checkout. Groups the shim
 leaves unresolved on purpose are listed in `DELIBERATELY_ABSENT` with a
 reason, and the list fails if it goes stale.
 
@@ -379,11 +408,10 @@ past the shim.
 
 ## Not simulated yet
 
-- **Forward-pass metrics (FPM).** The wire schema is implemented and matched to
-  Dynamo's (its contract test passes), but the engine publishes no FPM stream;
-  scheduler metrics go over the simpler `metrics_ipc_name` socket instead.
 - **Multi-rank KV events.** One DP rank per worker. The per-rank port offset is
   implemented, but nothing drives `dp_size > 1`.
+- **Multi-rank FPM.** Engine publication currently supports one DP rank per
+  worker; enabling it with `dp_size > 1` raises an explicit error.
 - **Gateway mode (`--gateway-workers`)**: see Known gaps above.
 - Multimodal, embedding/rerank, diffusion, LoRA, and weight updates — these
   raise a clear `NotImplementedError` rather than pretending.
