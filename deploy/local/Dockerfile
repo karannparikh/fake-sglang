@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 COPY models ./models
+COPY launch ./launch
 COPY tests ./tests
 COPY scripts ./scripts
 COPY deploy/local ./deploy/local

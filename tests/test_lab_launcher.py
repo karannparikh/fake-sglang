@@ -6,6 +6,13 @@ import time
 import pytest
 
 
+def test_image_includes_upstream_cluster_launcher():
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "deploy/local/Dockerfile").read_text()
+    assert "COPY launch ./launch" in dockerfile
+    assert (root / "launch/cluster.py").is_file()
+
+
 @pytest.mark.parametrize("command", ["traffic", "routing-test", "routing-dashboard"])
 def test_missing_benchmark_commands_fail_before_cluster_access(tmp_path, command):
     source = Path(__file__).resolve().parents[1] / "deploy/local/lab.sh"
