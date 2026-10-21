@@ -6,8 +6,8 @@ not the engine ever writes to it. Leaving it silent would make every fake
 worker report zero load, which quietly breaks load-based routing and the
 Planner -- so the scheduler pushes its real counters at SGLang's own cadence.
 
-KV *events* (the prefix-tree feed that KV-aware routing needs) are a separate
-channel and are not published yet; see the README.
+KV events (the prefix-tree feed) and observed prefix-cache metrics are
+published separately; see the README.
 """
 
 from __future__ import annotations
@@ -90,7 +90,10 @@ class MetricsPusher:
             kv_total_blocks=self.scheduler.config.total_kv_tokens,
             num_requests_waiting=stats["num_waiting_reqs"],
             gpu_cache_usage_perc=stats["token_usage"],
-            gpu_prefix_cache_hit_rate=0.0,
+            gpu_prefix_cache_hit_rate=(
+                stats["prefix_cache_hit_tokens"] / stats["prefix_cache_query_tokens"]
+                if stats["prefix_cache_query_tokens"] else 0.0
+            ),
             data_parallel_rank=self.dp_rank,
         )
 

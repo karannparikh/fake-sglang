@@ -27,7 +27,7 @@ DYNAMO_SGLANG = Path(
     )
 )
 
-pytestmark = pytest.mark.skipif(
+requires_dynamo_source = pytest.mark.skipif(
     not DYNAMO_SGLANG.is_dir(),
     reason=f"Dynamo SGLang backend not found at {DYNAMO_SGLANG}",
 )
@@ -66,13 +66,29 @@ def _guards_import_error(handler: ast.ExceptHandler) -> bool:
     return any(n in ("ImportError", "ModuleNotFoundError") for n in names)
 
 
+def _allows_absent_import(handler: ast.ExceptHandler) -> bool:
+    for statement in handler.body:
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            if isinstance(statement.value, ast.Constant) and statement.value.value is None:
+                continue
+        if isinstance(statement, ast.Return):
+            if statement.value is None or (
+                isinstance(statement.value, ast.Constant) and statement.value.value is None
+            ):
+                continue
+        if isinstance(statement, ast.Pass):
+            continue
+        return False
+    return bool(handler.body)
+
+
 def _collect() -> tuple:
     """Split imports into required ones and N/N-1 alternative groups.
 
     Dynamo's ``_compat.py`` deliberately tries a new SGLang path and falls back
     to an old one. A shim pinned to a single SGLang version legitimately
     provides only one side, so an alternative group passes when ANY member
-    resolves -- but a group where none resolves is a real break.
+    resolves. Explicit None/no-op fallbacks also permit the import to be absent.
     """
     required: Set[tuple] = set()
     groups: list = []
@@ -85,7 +101,12 @@ def _collect() -> tuple:
             _guards_import_error(h) for h in node.handlers
         ):
             alternatives = _sglang_imports(node)
-            if alternatives:
+            guarded.update(alternatives)
+            optional = any(
+                _guards_import_error(h) and _allows_absent_import(h)
+                for h in node.handlers
+            )
+            if alternatives and not optional:
                 groups.append(alternatives)
             return
         for child in ast.iter_child_nodes(node):
@@ -93,11 +114,8 @@ def _collect() -> tuple:
 
     for path in _source_files():
         tree = ast.parse(path.read_text(), filename=str(path))
-        before = len(groups)
-        visit(tree)
         guarded: Set[tuple] = set()
-        for group in groups[before:]:
-            guarded |= group
+        visit(tree)
         required |= _sglang_imports(tree) - guarded
     return required, groups
 
@@ -150,6 +168,7 @@ def _direct_attributes(receiver: str) -> Set[str]:
     return found - optional
 
 
+@requires_dynamo_source
 def test_every_required_import_resolves():
     required, _ = _collect()
     missing = sorted(
@@ -166,6 +185,7 @@ def _name(module: str, symbol) -> str:
     return f"{module}.{symbol}" if symbol else module
 
 
+@requires_dynamo_source
 def test_every_compat_fallback_group_has_a_live_option():
     _, groups = _collect()
     dead = [
@@ -180,6 +200,30 @@ def test_every_compat_fallback_group_has_a_live_option():
     )
 
 
+@pytest.mark.parametrize(
+    "fallback,expected_groups",
+    [
+        ("value = None", 0),
+        ("pass", 0),
+        ("return None", 0),
+        ("from sglang.old import value", 1),
+        ("raise", 1),
+        ("value = unsupported()", 1),
+    ],
+)
+def test_import_guard_distinguishes_optional_and_required_fallbacks(
+    tmp_path, monkeypatch, fallback, expected_groups
+):
+    source = tmp_path / "compat.py"
+    source.write_text(f"try:\n    from sglang.new import value\nexcept ImportError:\n    {fallback}\n")
+    monkeypatch.setattr(__import__(__name__, fromlist=["_source_files"]),
+                        "_source_files", lambda: iter([source]))
+    required, groups = _collect()
+    assert required == set()
+    assert len(groups) == expected_groups
+
+
+@requires_dynamo_source
 def test_server_args_declares_every_field_dynamo_reads():
     from sglang.srt.server_args import ServerArgs
 
@@ -198,6 +242,7 @@ def test_server_args_declares_every_field_dynamo_reads():
     )
 
 
+@requires_dynamo_source
 def test_tokenizer_manager_exposes_everything_dynamo_calls():
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.server_args import ServerArgs
@@ -213,6 +258,7 @@ def test_tokenizer_manager_exposes_everything_dynamo_calls():
     )
 
 
+@requires_dynamo_source
 def test_engine_exposes_everything_dynamo_calls():
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.server_args import ServerArgs
@@ -233,11 +279,17 @@ def test_engine_exposes_everything_dynamo_calls():
     )
 
 
+@requires_dynamo_source
 def test_deliberately_absent_list_is_current():
     """An entry Dynamo no longer imports, or one the shim now provides, is a
     stale decision and should be deleted rather than left to mislead."""
-    _, groups = _collect()
-    guarded = {_name(m, s) for group in groups for m, s in group}
+    guarded = {
+        _name(m, s)
+        for path in _source_files()
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.Try) and any(_guards_import_error(h) for h in node.handlers)
+        for m, s in _sglang_imports(node)
+    }
     stale = sorted(
         name
         for name in DELIBERATELY_ABSENT
@@ -246,6 +298,22 @@ def test_deliberately_absent_list_is_current():
     assert not stale, "Stale DELIBERATELY_ABSENT entries:\n  " + "\n  ".join(stale)
 
 
+def test_optional_imports_remain_in_absence_inventory(tmp_path, monkeypatch):
+    source = tmp_path / "compat.py"
+    source.write_text(
+        "try:\n    from sglang.optional import value\n"
+        "except ImportError:\n    value = None\n"
+    )
+    module = __import__(__name__, fromlist=["_source_files"])
+    monkeypatch.setattr(module, "_source_files", lambda: iter([source]))
+    monkeypatch.setattr(module, "DELIBERATELY_ABSENT", {"sglang.optional.value": "optional"})
+    test_deliberately_absent_list_is_current()
+    source.write_text("")
+    with pytest.raises(AssertionError, match="Stale DELIBERATELY_ABSENT"):
+        test_deliberately_absent_list_is_current()
+
+
+@requires_dynamo_source
 def test_engine_class_attributes_dynamo_reads_exist():
     """``sgl.Engine.<name>`` read off the class, private names included.
 
@@ -266,6 +334,7 @@ def test_engine_class_attributes_dynamo_reads_exist():
     )
 
 
+@requires_dynamo_source
 def test_env_fields_dynamo_reads_have_sglang_types():
     """``envs.X.get()`` must return SGLang's type, not the raw string: Dynamo
     compares them (``envs.SGLANG_MAX_THINK_TOKENS.get() >= 0``)."""
@@ -282,6 +351,7 @@ def test_env_fields_dynamo_reads_have_sglang_types():
     )
 
 
+@requires_dynamo_source
 def test_dynamo_sees_cache_salt_support():
     """Dynamo only sends a salt after checking both the native request type
     and the async_generate signature; either missing makes it refuse salted

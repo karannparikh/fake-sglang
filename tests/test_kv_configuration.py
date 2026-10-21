@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fakeengine.config import SimConfig
+from fakeengine.kvcache import BlockPool, block_hashes
 from fakeengine.scheduler import Request, Scheduler
 from fakeengine.timing import TimingModel
 from fakeengine.topology import Link
@@ -155,3 +156,59 @@ def test_generation_cost_does_not_change_decode_or_transfer(server_args):
     assert timing.transfer_ms(1000) == baseline.transfer_ms(1000)
     link = Link(name="rack", bandwidth_gb_s=50, latency_ms=0.05)
     assert timing.transfer_ms(1000, link) == baseline.transfer_ms(1000, link)
+
+
+async def test_observed_generation_time_excludes_cache_transfer_and_no_peer_probes(server_args):
+    config = SimConfig.from_server_args(server_args(
+        page_size=4, max_prefill_tokens=4, fake_kv_generation_ms_per_1k_tokens=100,
+        fake_speedup_ratio=10,
+    ))
+    scheduler = Scheduler(config)
+    try:
+        for rid, prompt, prebuilt, enabled, expected_seconds in [
+            ("cold", list(range(8)), False, True, 0.00008),
+            ("warm", list(range(8)), False, True, 0.00008),
+            ("extend", list(range(10)), False, True, 0.0001),
+            ("transfer", list(range(12)), True, True, 0.0001),
+            ("probe", list(range(100, 108)), False, False, 0.0001),
+        ]:
+            request = scheduler.submit(Request(
+                rid, prompt, 1, prebuilt=prebuilt, observe_cache=enabled,
+            ))
+            while not request.finished:
+                await scheduler._prefill_step()
+            assert scheduler.kv_generation_seconds == pytest.approx(expected_seconds)
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize("publish", [False, True])
+def test_pool_observes_pressure_eviction_separately_from_flush_and_protects_active_blocks(publish):
+    observations, removed = [], []
+    pool = BlockPool(
+        3, 4, on_evict=removed.extend if publish else None,
+        on_change=lambda: observations.append(
+            (pool.cached_blocks, pool.used_blocks, pool.evictable_blocks,
+             pool.evicted_blocks, pool.cleared_blocks),
+        ),
+    )
+    hashes = block_hashes(list(range(12)), 4)
+    blocks = pool.allocate(3)
+    pool.insert_prefix(hashes, blocks)
+    assert observations[-1] == (3, 3, 0, 0, 0)
+    assert pool.allocate(1) is None
+    pool.clear_cache()
+    assert observations[-1] == (3, 3, 0, 0, 0)
+    pool.free(blocks)
+    assert observations[-1] == (3, 3, 3, 0, 0)
+    shared = pool.acquire_prefix(hashes[:1])
+    assert observations[-1] == (3, 3, 2, 0, 0)
+    allocated = pool.allocate(1)
+    assert observations[-1] == (2, 3, 1, 1, 0)
+    pool.free(allocated)
+    pool.clear_cache()
+    assert observations[-1] == (1, 1, 0, 1, 1)
+    pool.free(shared)
+    pool.clear_cache()
+    assert observations[-1] == (0, 0, 0, 1, 2)
+    assert len(removed) == (3 if publish else 0)

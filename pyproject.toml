@@ -10,6 +10,7 @@ dependencies = [
     "aiohttp>=3.9",
     "msgspec>=0.19.0",
     "pyzmq>=26.0.0",
+    "prometheus-client>=0.21.0",
     "pyyaml",          # launch/cluster.py
 ]
 

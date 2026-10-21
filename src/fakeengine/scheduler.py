@@ -21,10 +21,18 @@ import asyncio
 import logging
 import math
 import time
+from statistics import pvariance
 from typing import Dict, List, Optional, Sequence
 
+from sglang.srt.observability.forward_pass_metrics import (
+    QueuedRequestMetrics,
+    ScheduledRequestMetrics,
+)
+
 from fakeengine import tokens as token_gen
+from fakeengine.cache_metrics import PrefixCacheMetrics
 from fakeengine.config import SimConfig
+from fakeengine.fpm import ForwardPassPublisher
 from fakeengine.kv_events import NullKvEventEmitter
 from fakeengine.kvcache import BlockPool, block_hashes
 from fakeengine.timing import TimingModel
@@ -41,6 +49,7 @@ class Request:
         "rid", "prompt_ids", "max_new_tokens", "prebuilt", "first_token",
         "queue", "blocks", "prefilled", "generated", "cached_tokens",
         "_stream", "_hashes", "finished", "arrival", "cache_salt",
+        "_cache_observed", "observe_cache",
     )
 
     def __init__(
@@ -52,6 +61,7 @@ class Request:
         prebuilt: bool = False,
         first_token: Optional[int] = None,
         cache_salt: Optional[str] = None,
+        observe_cache: bool = True,
     ) -> None:
         self.rid = rid
         # Prefix-cache namespace: only requests with the same salt share KV.
@@ -69,6 +79,8 @@ class Request:
         self._stream = None
         self.finished = False
         self.arrival = time.monotonic()
+        self._cache_observed = False
+        self.observe_cache = observe_cache
 
     @property
     def total_tokens(self) -> int:
@@ -76,18 +88,25 @@ class Request:
 
 
 class Scheduler:
-    def __init__(self, config: SimConfig, kv_events=None) -> None:
+    def __init__(
+        self, config: SimConfig, kv_events=None,
+        fpm: Optional[ForwardPassPublisher] = None,
+        cache_metrics: Optional[PrefixCacheMetrics] = None,
+    ) -> None:
         self.config = config
         self.timing = TimingModel(config)
         # The emitter is wired into the pool itself so an eviction cannot
         # happen without the router hearing about it, whichever code path
         # triggered it.
         self.kv_events = kv_events or NullKvEventEmitter()
+        self.cache_metrics = cache_metrics
         self.pool = BlockPool(
             config.num_kv_blocks,
             config.block_size,
             on_evict=self.kv_events.publish_removed,
+            on_change=self._publish_cache_state,
         )
+        self._publish_cache_state()
         self.waiting: List[Request] = []
         self.running: List[Request] = []
         self.by_rid: Dict[str, Request] = {}
@@ -95,6 +114,11 @@ class Scheduler:
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
         self.last_step_ms = 0.0
+        self.fpm = fpm
+        self.prefix_cache_query_tokens = 0
+        self.prefix_cache_hit_tokens = 0
+        self.prefix_cache_queries = 0
+        self.kv_generation_seconds = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -112,6 +136,9 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self.fpm is not None:
+            self.fpm.close()
+            self.fpm = None
 
     # -- submission --------------------------------------------------------
 
@@ -140,6 +167,10 @@ class Scheduler:
 
     # -- stats -------------------------------------------------------------
 
+    def _publish_cache_state(self) -> None:
+        if self.cache_metrics is not None:
+            self.cache_metrics.update_pool(self.pool)
+
     def stats(self) -> dict:
         return {
             "num_running_reqs": len(self.running),
@@ -149,16 +180,50 @@ class Scheduler:
             "kv_used_blocks": self.pool.used_blocks,
             "kv_total_blocks": self.pool.num_blocks,
             "kv_cached_blocks": self.pool.cached_blocks,
+            "kv_evicted_blocks": self.pool.evicted_blocks,
+            "kv_cleared_blocks": self.pool.cleared_blocks,
             "last_step_ms": self.last_step_ms,
+            "prefix_cache_query_tokens": self.prefix_cache_query_tokens,
+            "prefix_cache_hit_tokens": self.prefix_cache_hit_tokens,
+            "prefix_cache_queries": self.prefix_cache_queries,
+            "kv_generation_seconds": self.kv_generation_seconds,
         }
 
     # -- the loop ----------------------------------------------------------
+
+    def _queued_metrics(self, scheduled_ids=frozenset()) -> QueuedRequestMetrics:
+        waiting = [r for r in self.waiting if r.rid not in scheduled_ids]
+        prefill = [
+            max(len(r.prompt_ids) - max(r.prefilled, r.cached_tokens), 0)
+            for r in waiting if not r.prebuilt
+        ]
+        decode = [r.total_tokens for r in waiting if r.prebuilt]
+        decode += [r.total_tokens for r in self.running if r.rid not in scheduled_ids]
+        return QueuedRequestMetrics(
+            num_prefill_requests=len(prefill),
+            sum_prefill_tokens=sum(prefill),
+            var_prefill_length=float(pvariance(prefill)) if prefill else 0.0,
+            num_decode_requests=len(decode),
+            sum_decode_kv_tokens=sum(decode),
+            var_decode_kv_tokens=float(pvariance(decode)) if decode else 0.0,
+        )
+
+    def _publish_idle_fpm(self) -> None:
+        if self.fpm is not None and time.monotonic() - self.fpm.last_publish >= 1.0:
+            self.fpm.publish(ScheduledRequestMetrics(), self._queued_metrics(), 0.0)
 
     async def _run(self) -> None:
         while not self._stopping:
             if not self.waiting and not self.running:
                 self._wakeup.clear()
-                await self._wakeup.wait()
+                if self.fpm is None:
+                    await self._wakeup.wait()
+                else:
+                    self._publish_idle_fpm()
+                    try:
+                        await asyncio.wait_for(self._wakeup.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
                 continue
             if await self._prefill_step():
                 continue
@@ -167,6 +232,7 @@ class Scheduler:
                 continue
             # Waiting requests that no step can admit: the KV pool is full of
             # referenced blocks. Yield rather than spin; a completion frees them.
+            self._publish_idle_fpm()
             await asyncio.sleep(0.001)
 
     async def _prefill_step(self) -> bool:
@@ -181,7 +247,11 @@ class Scheduler:
         budget = self.config.max_batched_tokens
         admitted: List[Request] = []
         computed_tokens = 0     # tokens actually recomputed (billed for time)
+        observed_computed_tokens = 0
         moved_tokens = 0        # tokens advanced, cached or not (progress check)
+        scheduled_ids = set()
+        prefill_lengths = []
+        prefill_kv_tokens = 0
 
         while self.waiting and budget > 0:
             if len(self.running) + len(admitted) >= self.config.max_running_requests:
@@ -198,10 +268,26 @@ class Scheduler:
             if not self._grow_blocks(request, request.prefilled + chunk):
                 break
 
+            if request.observe_cache and not request.prebuilt and not request._cache_observed:
+                prompt_tokens = len(request.prompt_ids)
+                self.prefix_cache_query_tokens += prompt_tokens
+                self.prefix_cache_hit_tokens += request.cached_tokens
+                self.prefix_cache_queries += 1
+                if self.cache_metrics is not None:
+                    self.cache_metrics.observe(prompt_tokens, request.cached_tokens)
+                request._cache_observed = True
+
             # Cached prefix blocks and KV that arrived over the transfer are
             # occupancy, not compute: they must not be billed as prefill time.
             free_tokens = max(request.cached_tokens - request.prefilled, 0)
-            computed_tokens += max(chunk - free_tokens, 0)
+            computed = max(chunk - free_tokens, 0)
+            computed_tokens += computed
+            if request.observe_cache:
+                observed_computed_tokens += computed
+            scheduled_ids.add(request.rid)
+            if computed:
+                prefill_lengths.append(computed)
+                prefill_kv_tokens += max(request.prefilled, request.cached_tokens)
             request.prefilled += chunk
             moved_tokens += chunk
             budget -= chunk
@@ -215,7 +301,22 @@ class Scheduler:
         if moved_tokens == 0 and not admitted:
             return False
 
-        await self._sleep_step(self.timing.prefill_ms(computed_tokens))
+        kv_seconds = self.timing.kv_generation_ms(observed_computed_tokens) / (
+            1000.0 * self.config.speedup_ratio
+        )
+        self.kv_generation_seconds += kv_seconds
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_generation(kv_seconds)
+        await self._sleep_step(
+            self.timing.prefill_ms(computed_tokens),
+            ScheduledRequestMetrics(
+                num_prefill_requests=len(prefill_lengths),
+                sum_prefill_tokens=computed_tokens,
+                var_prefill_length=float(pvariance(prefill_lengths)) if prefill_lengths else 0.0,
+                sum_prefill_kv_tokens=prefill_kv_tokens,
+            ),
+            scheduled_ids,
+        )
 
         for request in admitted:
             if request.finished:
@@ -228,7 +329,16 @@ class Scheduler:
     async def _decode_step(self) -> None:
         if not self.running:
             return
-        await self._sleep_step(self.timing.decode_step_ms(len(self.running)))
+        decode_lengths = [r.total_tokens for r in self.running]
+        await self._sleep_step(
+            self.timing.decode_step_ms(len(self.running)),
+            ScheduledRequestMetrics(
+                num_decode_requests=len(decode_lengths),
+                sum_decode_kv_tokens=sum(decode_lengths),
+                var_decode_kv_tokens=float(pvariance(decode_lengths)),
+            ),
+            {r.rid for r in self.running},
+        )
 
         for request in list(self.running):
             if request.finished:
@@ -250,9 +360,16 @@ class Scheduler:
             elif request.total_tokens >= self.config.context_len:
                 self._finish(request, FINISH_LENGTH)
 
-    async def _sleep_step(self, milliseconds: float) -> None:
+    async def _sleep_step(
+        self, milliseconds: float, scheduled: ScheduledRequestMetrics, scheduled_ids: set,
+    ) -> None:
         self.last_step_ms = milliseconds
         await self.timing.sleep_ms(milliseconds)
+        if self.fpm is not None:
+            self.fpm.publish(
+                scheduled, self._queued_metrics(scheduled_ids),
+                milliseconds / (1000.0 * self.config.speedup_ratio),
+            )
 
     # -- helpers -----------------------------------------------------------
 
