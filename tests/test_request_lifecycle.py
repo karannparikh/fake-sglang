@@ -50,7 +50,7 @@ async def test_abort_during_prefill_does_not_resurrect_request(server_args):
         entered.set()
         await resume.wait()
 
-    scheduler._sleep_step = pause
+    scheduler.timing.sleep_ms = pause
     request = scheduler.submit(Request("cancel", [1, 2, 3], 2))
     task = asyncio.create_task(scheduler._prefill_step())
     try:

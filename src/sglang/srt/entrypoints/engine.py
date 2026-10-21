@@ -30,7 +30,9 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 from fakeengine import tokens as token_gen
 from fakeengine.bootstrap import BootstrapClient, BootstrapServer
+from fakeengine.cache_metrics import PrefixCacheMetrics
 from fakeengine.config import SimConfig, announce
+from fakeengine.fpm import ForwardPassPublisher
 from fakeengine.kv_events import build_emitter
 from fakeengine.scheduler import Request, Scheduler
 from fakeengine.stats import MetricsPusher
@@ -187,6 +189,8 @@ class Engine:
         self.server_args = server_args
         self.model_config = server_args.get_model_config()
         self.sim_config = SimConfig.from_server_args(server_args)
+        if server_args.enable_forward_pass_metrics and server_args.dp_size != 1:
+            raise ValueError("Forward-pass metrics currently require --dp-size 1")
         self.sim_config.bootstrap_host = _advertised_host(server_args)
         announce(self.sim_config)
 
@@ -194,14 +198,27 @@ class Engine:
         # router subscribes as soon as the worker registers, and a socket that
         # appears late drops the events published before it.
         self.kv_events = build_emitter(server_args, self.sim_config.block_size)
-        self.scheduler = Scheduler(self.sim_config, kv_events=self.kv_events)
+        fpm = None
+        try:
+            cache_metrics = PrefixCacheMetrics() if server_args.enable_metrics else None
+            if server_args.enable_forward_pass_metrics:
+                fpm = ForwardPassPublisher(
+                    server_args.forward_pass_metrics_ipc_name,
+                    server_args.forward_pass_metrics_worker_id,
+                )
+            self.scheduler = Scheduler(
+                self.sim_config, kv_events=self.kv_events,
+                fpm=fpm, cache_metrics=cache_metrics,
+            )
+            self.port_args = PortArgs(server_args)
+            self._metrics = MetricsPusher(self.scheduler, self.port_args.metrics_ipc_name)
+        except Exception:
+            if fpm is not None:
+                fpm.close()
+            self.kv_events.shutdown()
+            raise
         self._scheduler_init_result = _SchedulerInitResult(self.sim_config)
         self.tokenizer_manager = TokenizerManager(self)
-
-        # Dynamo's publisher binds a PULL socket on metrics_ipc_name during
-        # init_decode/init_prefill, before the first request ever arrives.
-        self.port_args = PortArgs(server_args)
-        self._metrics = MetricsPusher(self.scheduler, self.port_args.metrics_ipc_name)
 
         self._bootstrap_server: Optional[BootstrapServer] = None
         self._bootstrap_client: Optional[BootstrapClient] = None
@@ -394,7 +411,11 @@ class Engine:
                     yield chunk
             return
 
-        request = Request(request_id, prompt_ids, max_new_tokens, cache_salt=cache_salt)
+        request = Request(
+            request_id, prompt_ids, max_new_tokens, cache_salt=cache_salt,
+            # Dynamo's disaggregated canaries and warmup use a no-peer transfer.
+            observe_cache=bootstrap_host != FAKE_BOOTSTRAP_HOST,
+        )
         self.scheduler.submit(request)
 
         sender: Optional[KVSender] = None

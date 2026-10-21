@@ -7,11 +7,9 @@ msgspec field names, order, and types must match that module field for field.
 ``dynamo/components/src/dynamo/sglang/tests/test_fpm_contract.py`` asserts
 exactly that, in both directions.
 
-The fake engine does not publish FPM yet -- it publishes the simpler scheduler
-metrics over ``port_args.metrics_ipc_name`` (see ``fakeengine/stats.py``) --
-but the codec has to be right so the contract test is meaningful and so
-enabling ``--enable-forward-pass-metrics`` is a wiring change, not a schema
-change.
+With ``--enable-forward-pass-metrics``, ``fakeengine.fpm`` publishes this
+schema through Dynamo's injected per-rank IPC endpoint. Timings describe
+simulated scheduler passes, not measured GPU execution.
 """
 
 from __future__ import annotations

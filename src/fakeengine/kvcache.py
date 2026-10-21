@@ -97,10 +97,14 @@ class BlockPool:
         num_blocks: int,
         block_size: int,
         on_evict: Optional[Callable[[List[int]], None]] = None,
+        on_change: Optional[Callable[[], None]] = None,
     ) -> None:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self._on_evict = on_evict
+        self._on_change = on_change
+        self.evicted_blocks = 0
+        self.cleared_blocks = 0
         self._free_clean: List[int] = list(range(num_blocks))
         self._cached: "OrderedDict[bytes, int]" = OrderedDict()  # digest -> block
         self._block_to_digest: Dict[int, bytes] = {}
@@ -122,6 +126,10 @@ class BlockPool:
     @property
     def cached_blocks(self) -> int:
         return len(self._cached)
+
+    @property
+    def evictable_blocks(self) -> int:
+        return self._evictable_count()
 
     @property
     def usage(self) -> float:
@@ -163,6 +171,7 @@ class BlockPool:
             # going back to the clean pool; only eviction clears it.
             if block not in self._block_to_digest and block not in self._free_clean:
                 self._free_clean.append(block)
+        self._notify_changed()
 
     def _release(self, blocks: Sequence[int]) -> None:
         for block in blocks:
@@ -199,6 +208,7 @@ class BlockPool:
             self._cached.move_to_end(digest)
             self._refcount[block] = self._refcount.get(block, 0) + 1
             acquired.append(block)
+        self._notify_changed()
         return acquired
 
     def insert_prefix(
@@ -225,12 +235,13 @@ class BlockPool:
             self._block_to_digest[block] = digest
             self._parents[digest] = hashes[index - 1] if index else None
             added.append((index, digest))
+        self._notify_changed()
         return added
 
     def clear_cache(self) -> None:
         """Drop every unreferenced cache entry, reporting the removals."""
         evicted: List[int] = []
-        while self._evict_one(collect=evicted):
+        while self._evict_one(collect=evicted, clearing=True):
             pass
         self._notify_evicted(evicted)
 
@@ -239,7 +250,7 @@ class BlockPool:
     def _evictable_count(self) -> int:
         return sum(1 for b in self._cached.values() if self._refcount.get(b, 0) == 0)
 
-    def _evict_one(self, collect: Optional[List[int]] = None) -> bool:
+    def _evict_one(self, collect: Optional[List[int]] = None, *, clearing: bool = False) -> bool:
         """Evict an LRU leaf so no reusable child outlives its published parent."""
         non_leaves = set(self._parents.values())
         for digest, block in self._cached.items():
@@ -248,6 +259,10 @@ class BlockPool:
             del self._cached[digest]
             del self._parents[digest]
             self._block_to_digest.pop(block, None)
+            if clearing:
+                self.cleared_blocks += 1
+            else:
+                self.evicted_blocks += 1
             if block not in self._free_clean:
                 self._free_clean.append(block)
             if collect is None:
@@ -258,5 +273,10 @@ class BlockPool:
         return False
 
     def _notify_evicted(self, ids: List[int]) -> None:
+        self._notify_changed()
         if ids and self._on_evict is not None:
             self._on_evict(ids)
+
+    def _notify_changed(self) -> None:
+        if self._on_change is not None:
+            self._on_change()
