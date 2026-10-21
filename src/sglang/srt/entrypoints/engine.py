@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import aclosing
+from contextlib import AsyncExitStack, ExitStack, aclosing
+from itertools import count
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
@@ -49,7 +50,7 @@ class _SchedulerInitResult:
     no capacity figure for this worker.
     """
 
-    def __init__(self, config: SimConfig) -> None:
+    def __init__(self, config: SimConfig, dp_size: int = 1) -> None:
         self.scheduler_infos: List[Dict[str, Any]] = [
             {
                 "max_total_num_tokens": config.total_kv_tokens,
@@ -57,7 +58,7 @@ class _SchedulerInitResult:
                 "max_prefill_tokens": config.max_batched_tokens,
                 "max_running_requests": config.max_running_requests,
                 "hicache_host_total_tokens": 0,
-            }
+            } for _ in range(dp_size)
         ]
 
 
@@ -93,23 +94,26 @@ class TokenizerManager:
             return_logprob=getattr(obj, "return_logprob", False),
             top_logprobs_num=getattr(obj, "top_logprobs_num", 0),
             cache_salt=getattr(obj, "cache_salt", None),
+            routed_dp_rank=getattr(obj, "routed_dp_rank", None),
+            data_parallel_rank=getattr(obj, "data_parallel_rank", None),
         )
-        async for chunk in stream:
-            yield chunk
+        async with aclosing(stream):
+            async for chunk in stream:
+                yield chunk
 
     def abort_request(self, rid: str = "", abort_all: bool = False) -> None:
-        scheduler = self._engine.scheduler
-        if abort_all:
-            for pending in list(scheduler.by_rid):
-                scheduler.abort(pending)
-            return
-        if rid:
-            scheduler.abort(rid)
+        for scheduler in self._engine.schedulers:
+            if abort_all:
+                for pending in list(scheduler.by_rid):
+                    scheduler.abort(pending)
+            elif rid:
+                scheduler.abort(rid)
 
     # -- cache / memory ----------------------------------------------------
 
     async def flush_cache(self) -> Any:
-        self._engine.scheduler.flush_cache()
+        for scheduler in self._engine.schedulers:
+            scheduler.flush_cache()
         return type("FlushResult", (), {"success": True})()
 
     async def clear_hicache_storage(self) -> Any:
@@ -189,49 +193,80 @@ class Engine:
         self.server_args = server_args
         self.model_config = server_args.get_model_config()
         self.sim_config = SimConfig.from_server_args(server_args)
-        if server_args.enable_forward_pass_metrics and server_args.dp_size != 1:
-            raise ValueError("Forward-pass metrics currently require --dp-size 1")
+        if server_args.dp_size > 1 and (
+            not server_args.enable_dp_attention or server_args.nnodes != 1
+            or server_args.node_rank != 0 or server_args.is_embedding
+        ):
+            raise ValueError(
+                "Packed fake workers require --enable-dp-attention, one node, "
+                "node rank zero, and a generation model"
+            )
         self.sim_config.bootstrap_host = _advertised_host(server_args)
         announce(self.sim_config)
 
         # Publishing starts with the engine, not with the first request: the
         # router subscribes as soon as the worker registers, and a socket that
         # appears late drops the events published before it.
-        self.kv_events = build_emitter(server_args, self.sim_config.block_size)
-        fpm = None
-        try:
-            cache_metrics = PrefixCacheMetrics() if server_args.enable_metrics else None
-            if server_args.enable_forward_pass_metrics:
-                fpm = ForwardPassPublisher(
-                    server_args.forward_pass_metrics_ipc_name,
-                    server_args.forward_pass_metrics_worker_id,
+        self.schedulers: List[Scheduler] = []
+        self._rank_events = []
+        self._rank_metrics: List[MetricsPusher] = []
+        self._unrouted_rank = count()
+        self.port_args = PortArgs(server_args)
+        with ExitStack() as cleanup:
+            for rank in range(server_args.dp_size):
+                events = build_emitter(
+                    server_args, self.sim_config.block_size, dp_rank=rank,
                 )
-            self.scheduler = Scheduler(
-                self.sim_config, kv_events=self.kv_events,
-                fpm=fpm, cache_metrics=cache_metrics,
+                cleanup.callback(events.shutdown)
+                self._rank_events.append(events)
+                cache_metrics = (
+                    PrefixCacheMetrics(dp_rank=rank) if server_args.enable_metrics else None
+                )
+                fpm = None
+                if server_args.enable_forward_pass_metrics:
+                    fpm = ForwardPassPublisher(
+                        server_args.forward_pass_metrics_ipc_name,
+                        server_args.forward_pass_metrics_worker_id,
+                        dp_rank=rank,
+                    )
+                    cleanup.callback(fpm.close)
+                scheduler = Scheduler(
+                    self.sim_config, kv_events=events,
+                    fpm=fpm, cache_metrics=cache_metrics,
+                )
+                self.schedulers.append(scheduler)
+                self._rank_metrics.append(MetricsPusher(
+                    scheduler, self.port_args.metrics_ipc_name, dp_rank=rank,
+                ))
+            # Preserve the single-rank inspection surface used by existing tools.
+            self.scheduler = self.schedulers[0]
+            self.kv_events = self._rank_events[0]
+            self._metrics = self._rank_metrics[0]
+            self._scheduler_init_result = _SchedulerInitResult(
+                self.sim_config, server_args.dp_size,
             )
-            self.port_args = PortArgs(server_args)
-            self._metrics = MetricsPusher(self.scheduler, self.port_args.metrics_ipc_name)
-        except Exception:
-            if fpm is not None:
-                fpm.close()
-            self.kv_events.shutdown()
-            raise
-        self._scheduler_init_result = _SchedulerInitResult(self.sim_config)
-        self.tokenizer_manager = TokenizerManager(self)
+            self.tokenizer_manager = TokenizerManager(self)
 
-        self._bootstrap_server: Optional[BootstrapServer] = None
-        self._bootstrap_client: Optional[BootstrapClient] = None
-        if self.disaggregation_mode == "prefill":
-            self._bootstrap_server = BootstrapServer(
-                self.sim_config.bootstrap_host,
-                self.sim_config.bootstrap_port,
-                room_ttl_s=max(self.sim_config.bootstrap_timeout_s * 4, 60.0),
-            )
-        elif self.disaggregation_mode == "decode":
-            self._bootstrap_client = BootstrapClient(
-                self.sim_config.bootstrap_poll_interval_s,
-                self.sim_config.bootstrap_timeout_s,
+            self._bootstrap_server: Optional[BootstrapServer] = None
+            self._bootstrap_client: Optional[BootstrapClient] = None
+            if self.disaggregation_mode == "prefill":
+                self._bootstrap_server = BootstrapServer(
+                    self.sim_config.bootstrap_host,
+                    self.sim_config.bootstrap_port,
+                    room_ttl_s=max(self.sim_config.bootstrap_timeout_s * 4, 60.0),
+                )
+            elif self.disaggregation_mode == "decode":
+                self._bootstrap_client = BootstrapClient(
+                    self.sim_config.bootstrap_poll_interval_s,
+                    self.sim_config.bootstrap_timeout_s,
+                )
+            cleanup.pop_all()
+        if server_args.dp_size > 1:
+            logger.info(
+                "fake-sglang: packed %d independent DP ranks in one process; "
+                "%d KV tokens and %d running slots per rank",
+                server_args.dp_size, self.sim_config.total_kv_tokens,
+                self.sim_config.max_running_requests,
             )
         self._bootstrap_ready: Optional[asyncio.Task] = None
         self._started = False
@@ -252,12 +287,15 @@ class Engine:
         a worker that reports nothing until it is already busy is invisible to
         load-based routing exactly when routing matters.
         """
+        if self._shutdown:
+            raise RuntimeError("Engine has been shut down")
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return
-        self.scheduler.start()
-        self._metrics.start()
+        for scheduler, metrics in zip(self.schedulers, self._rank_metrics):
+            scheduler.start()
+            metrics.start()
         if self._bootstrap_server is not None and self._bootstrap_ready is None:
             self._bootstrap_ready = asyncio.get_running_loop().create_task(
                 self._bootstrap_server.start()
@@ -265,8 +303,7 @@ class Engine:
 
     async def _ensure_started(self) -> None:
         self._started = True
-        self.scheduler.start()
-        self._metrics.start()
+        self.start_background()
         if self._bootstrap_ready is not None:
             # Bind before the first request is answered: a decode peer can
             # reach this port as soon as Dynamo publishes the disaggregated
@@ -287,13 +324,25 @@ class Engine:
         loop.create_task(self._async_shutdown())
 
     async def _async_shutdown(self) -> None:
-        await self._metrics.stop()
-        await self.scheduler.stop()
-        self.kv_events.shutdown()
-        if self._bootstrap_server is not None:
-            await self._bootstrap_server.stop()
-        if self._bootstrap_client is not None:
-            await self._bootstrap_client.close()
+        self._shutdown = True
+        # Unwind every resource even if an earlier task failed.
+        async with AsyncExitStack() as cleanup:
+            if self._bootstrap_server is not None:
+                cleanup.push_async_callback(self._bootstrap_server.stop)
+            if self._bootstrap_client is not None:
+                cleanup.push_async_callback(self._bootstrap_client.close)
+            for events in self._rank_events:
+                cleanup.callback(events.shutdown)
+            for scheduler in self.schedulers:
+                cleanup.push_async_callback(scheduler.stop)
+            for metrics in self._rank_metrics:
+                cleanup.push_async_callback(metrics.stop)
+            if self._bootstrap_ready is not None:
+                self._bootstrap_ready.cancel()
+                try:
+                    await self._bootstrap_ready
+                except asyncio.CancelledError:
+                    pass
 
     # -- generation --------------------------------------------------------
 
@@ -309,6 +358,8 @@ class Engine:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         cache_salt: Optional[Union[List[str], str]] = None,
+        routed_dp_rank: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
         **kwargs: Any,
     ) -> AsyncIterator[dict]:
         """Returns the stream; the caller awaits this, then iterates it.
@@ -317,10 +368,12 @@ class Engine:
         does ``results = await engine.async_generate(...)`` and then hands
         ``results`` to a background drain task.
         """
-        await self._ensure_started()
-        self._resolve_routed_dp_rank(
-            kwargs.get("routed_dp_rank"), kwargs.get("data_parallel_rank")
+        rank = self._resolve_routed_dp_rank(
+            routed_dp_rank, data_parallel_rank,
         )
+        if rank is None:
+            rank = next(self._unrouted_rank) % len(self.schedulers)
+        await self._ensure_started()
 
         prompt_ids = _resolve_prompt_ids(input_ids, prompt, self.sim_config.vocab_size)
         params = dict(sampling_params or {})
@@ -335,6 +388,7 @@ class Engine:
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             cache_salt=_single_salt(cache_salt),
+            scheduler=self.schedulers[rank],
         )
 
     def _resolve_routed_dp_rank(
@@ -345,7 +399,7 @@ class Engine:
         """SGLang's DP-rank validation, against this worker's ``dp_size``.
 
         Dynamo reads this off the class (``gateway.GatewayEngine``), so it must
-        exist even though the fake engine runs one rank. Same rules as SGLang:
+        exist on the fake engine too. Same rules as SGLang:
         ``data_parallel_rank`` is the deprecated spelling, rank 0 on a single
         rank is a no-op, and anything out of range is an error rather than a
         silent reroute.
@@ -363,7 +417,9 @@ class Engine:
 
         if routed_dp_rank is None:
             return None
-        num_dp_ranks = max(int(getattr(self.server_args, "dp_size", 1) or 1), 1)
+        if isinstance(routed_dp_rank, bool) or not isinstance(routed_dp_rank, int):
+            raise ValueError(f"Invalid routed DP rank {routed_dp_rank!r}: expected an integer")
+        num_dp_ranks = self.server_args.dp_size
         if num_dp_ranks <= 1 and routed_dp_rank == 0:
             return None
         if routed_dp_rank < 0 or routed_dp_rank >= num_dp_ranks:
@@ -392,6 +448,7 @@ class Engine:
         bootstrap_host: Optional[str],
         bootstrap_port: Optional[int],
         bootstrap_room: Optional[int],
+        scheduler: Scheduler,
         cache_salt: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         mode = self.disaggregation_mode
@@ -406,6 +463,7 @@ class Engine:
                 bootstrap_port,
                 bootstrap_room,
                 started,
+                scheduler,
             )) as stream:
                 async for chunk in stream:
                     yield chunk
@@ -416,7 +474,7 @@ class Engine:
             # Dynamo's disaggregated canaries and warmup use a no-peer transfer.
             observe_cache=bootstrap_host != FAKE_BOOTSTRAP_HOST,
         )
-        self.scheduler.submit(request)
+        scheduler.submit(request)
 
         sender: Optional[KVSender] = None
         if mode == "prefill" and bootstrap_room is not None:
@@ -436,7 +494,7 @@ class Engine:
                         sender.send(len(prompt_ids), first_token=first)
                 yield chunk
         except BaseException as exc:
-            self.scheduler.abort(request_id)
+            scheduler.abort(request_id)
             if sender is not None and not published:
                 sender.fail(f"{type(exc).__name__}: {exc}")
             raise
@@ -450,6 +508,7 @@ class Engine:
         bootstrap_port: Optional[int],
         bootstrap_room: int,
         started: float,
+        scheduler: Scheduler,
     ) -> AsyncIterator[dict]:
         """Wait for the peer's KV, then decode from a prebuilt batch."""
         receiver = KVReceiver(
@@ -478,12 +537,12 @@ class Engine:
             prebuilt=True,
             first_token=handoff,
         )
-        self.scheduler.submit(request)
+        scheduler.submit(request)
         try:
             async for chunk in self._drain(request, started):
                 yield chunk
         finally:
-            self.scheduler.abort(request_id)
+            scheduler.abort(request_id)
 
     async def _drain(self, request: Request, started: float) -> AsyncIterator[dict]:
         """Turn scheduler events into SGLang response chunks.

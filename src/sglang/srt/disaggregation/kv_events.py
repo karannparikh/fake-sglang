@@ -142,19 +142,23 @@ class ZmqEventPublisher(EventPublisher):
 
         self._ctx = zmq.Context.instance()
         self._pub = self._ctx.socket(zmq.PUB)
-        self._pub.set_hwm(hwm)
-        if (
-            "*" in self._endpoint
-            or "::" in self._endpoint
-            or "0.0.0.0" in self._endpoint
-            or self._endpoint.startswith("ipc://")
-            or self._endpoint.startswith("inproc://")
-        ):
-            self._pub.bind(self._endpoint)
-            logger.info("fake-sglang KV events publishing on %s", self._endpoint)
-        else:
-            self._pub.connect(self._endpoint)
-            logger.info("fake-sglang KV events connecting to %s", self._endpoint)
+        try:
+            self._pub.set_hwm(hwm)
+            if (
+                "*" in self._endpoint
+                or "::" in self._endpoint
+                or "0.0.0.0" in self._endpoint
+                or self._endpoint.startswith("ipc://")
+                or self._endpoint.startswith("inproc://")
+            ):
+                self._pub.bind(self._endpoint)
+                logger.info("fake-sglang KV events publishing on %s", self._endpoint)
+            else:
+                self._pub.connect(self._endpoint)
+                logger.info("fake-sglang KV events connecting to %s", self._endpoint)
+        except Exception:
+            self._pub.close(linger=0)
+            raise
 
         self._running = True
         self._thread = threading.Thread(
