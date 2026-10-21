@@ -104,6 +104,7 @@ class BlockPool:
         self._free_clean: List[int] = list(range(num_blocks))
         self._cached: "OrderedDict[bytes, int]" = OrderedDict()  # digest -> block
         self._block_to_digest: Dict[int, bytes] = {}
+        self._parents: Dict[bytes, Optional[bytes]] = {}
         self._refcount: Dict[int, int] = {}
 
     # -- capacity ----------------------------------------------------------
@@ -222,6 +223,7 @@ class BlockPool:
                 continue
             self._cached[digest] = block
             self._block_to_digest[block] = digest
+            self._parents[digest] = hashes[index - 1] if index else None
             added.append((index, digest))
         return added
 
@@ -238,11 +240,13 @@ class BlockPool:
         return sum(1 for b in self._cached.values() if self._refcount.get(b, 0) == 0)
 
     def _evict_one(self, collect: Optional[List[int]] = None) -> bool:
-        """Evict the least-recently-used unreferenced cached block."""
+        """Evict an LRU leaf so no reusable child outlives its published parent."""
+        non_leaves = set(self._parents.values())
         for digest, block in self._cached.items():
-            if self._refcount.get(block, 0) != 0:
+            if self._refcount.get(block, 0) != 0 or digest in non_leaves:
                 continue
             del self._cached[digest]
+            del self._parents[digest]
             self._block_to_digest.pop(block, None)
             if block not in self._free_clean:
                 self._free_clean.append(block)

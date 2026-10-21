@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import aclosing
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
@@ -380,7 +381,7 @@ class Engine:
         started = time.monotonic()
 
         if mode == "decode" and bootstrap_room is not None:
-            async for chunk in self._decode_stream(
+            async with aclosing(self._decode_stream(
                 request_id,
                 prompt_ids,
                 max_new_tokens,
@@ -388,8 +389,9 @@ class Engine:
                 bootstrap_port,
                 bootstrap_room,
                 started,
-            ):
-                yield chunk
+            )) as stream:
+                async for chunk in stream:
+                    yield chunk
             return
 
         request = Request(request_id, prompt_ids, max_new_tokens, cache_salt=cache_salt)
@@ -413,6 +415,7 @@ class Engine:
                         sender.send(len(prompt_ids), first_token=first)
                 yield chunk
         except BaseException as exc:
+            self.scheduler.abort(request_id)
             if sender is not None and not published:
                 sender.fail(f"{type(exc).__name__}: {exc}")
             raise
@@ -455,8 +458,11 @@ class Engine:
             first_token=handoff,
         )
         self.scheduler.submit(request)
-        async for chunk in self._drain(request, started):
-            yield chunk
+        try:
+            async for chunk in self._drain(request, started):
+                yield chunk
+        finally:
+            self.scheduler.abort(request_id)
 
     async def _drain(self, request: Request, started: float) -> AsyncIterator[dict]:
         """Turn scheduler events into SGLang response chunks.
