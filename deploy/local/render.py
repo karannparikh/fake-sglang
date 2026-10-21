@@ -200,7 +200,7 @@ def observability():
             "dashboards.yaml": "grafana-dashboards.yaml",
         }),
         configmap("grafana-dashboard", ns, {
-            "dynamo-lab.json": "dashboard.json",
+            "dynamo-lab.json": "dashboard.json", "dynamo-routing-live.json": "routing-live-dashboard.json",
         }),
     ]
     mounts = [

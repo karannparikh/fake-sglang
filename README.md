@@ -54,10 +54,9 @@ observed cache metrics, forward-pass metrics (FPM), and packed data-parallel
 ranks. Those engine changes are not implemented by the lab files. Rendering
 manifests and regenerating the baseline dashboard work independently, but
 running this topology on an engine without those changes is not supported.
-The traffic and routing-benchmark utilities are a separate follow-up;
-`traffic`, `routing-test`, and `routing-dashboard` report an explicit error
-until their scripts are present. Benchmark dashboards and their observability
-wiring are not provisioned by this scaffold.
+The traffic and routing-benchmark utilities below use those same engine
+dependencies; this bundle does not implement them. Pure report/dashboard
+generation and unit tests work without a running engine.
 
 ```text
 OpenAI streaming traffic
@@ -104,7 +103,7 @@ The first run builds a native ARM64 Linux image containing genuine Dynamo
 wheels and explicitly CPU-only PyTorch. Subsequent runs reuse it. No weights
 or remote model code are downloaded. Image dependencies are pinned in
 `deploy/local/requirements.txt`; the separate AIPerf requirements file is
-reserved for the benchmark follow-up and is not installed by the lab image.
+used by the host replay environment and is not installed by the lab image.
 
 | Endpoint | URL |
 |---|---|
@@ -176,11 +175,111 @@ has eight running scheduler slots. For ten ranks, process-wide admission is
 an 85% active-decode-block threshold with output-block tracking. These are
 initial bounded lab settings, not production-calibrated limits.
 
+### Local traffic and routing comparisons
+
+After integrating the engine dependencies and starting the lab:
+
+```bash
+bash deploy/local/lab.sh traffic --requests 32 --concurrency 8
+bash deploy/local/lab.sh routing-test
+bash deploy/local/lab.sh routing-test --duration-seconds 600 --rate 100 --concurrency 256
+bash deploy/local/lab.sh routing-dashboard .local/routing-<run>/report.json
+```
+
+`traffic.py` validates streaming completion and server token usage; its
+optional `--rate` paces a bounded thread pool, not a guaranteed open-loop
+offered rate. `routing-test` runs fresh 2-prefill/1-decode processes per case
+inside a uniquely named, isolated lab pod. Both A/B conditions keep engine
+caching and event-driven KV routing enabled; only worker KV-event publication
+changes. Identical token-ID inputs, pinned cache seeding and pressure, and
+unpinned measured requests test routing and eviction propagation. The default
+is two pairs with alternating ON/OFF order. The lab image supplies Dynamo
+1.5.0, the Prometheus Python client and the simulator cache-metric extensions.
+
+The concurrent mode uses bounded open-loop arrivals: 80% select four hot
+prefix families, 20% select the remaining 28, and the hot set rotates every
+120 seconds. Client concurrency rejection, server/network failures, successes,
+drain, and scheduling lag are recorded separately. Overloaded cases can admit
+different subsets of the same offered sequence. This is a synthetic locality
+and saturation experiment, not a production trace or calibrated GPU benchmark.
+Worker IDs, ties, execution order and measured wall-clock latency are not
+deterministic. The seeded-owner statistic is not optimal-routing accuracy
+after baseline cache churn.
+
+Reports and logs stay in ignored `.local/routing-*/`. Recorded Grafana
+dashboards use exact saved timestamps and CSV measurements through Grafana's
+built-in TestData datasource, not random data. Missing latency/worker
+observations are not zero. Whole-case p95 values are distinct from one-second
+percentiles; E2E p95 minus TTFT p95 is not measured decode p95. The separate
+live dashboard is at `http://127.0.0.1:3000/d/dynamo-routing-live`.
+Publishing uses the generated `.local/grafana-password`, never a static password.
+
+### Full Mooncake replay and packed-rank probe
+
+`scripts/mooncake_lab.py` drives the deployed lab. Prepare an approved host
+AIPerf environment at `.local/aiperf-venv` using
+`deploy/local/aiperf-requirements.txt`, and cache tokenizer
+`Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`
+under `.local/aiperf-hf`. Obtain the complete Mooncake FAST'25
+`conversation_trace.jsonl` and `toolagent_trace.jsonl` separately under
+`.local/mooncake-100rps`; no trace data is bundled or downloaded by these tools.
+Record the download source and SHA-256 checksums with your local dataset;
+each replay also records the actual file SHA-256 in `invocation.json`.
+
+```bash
+python3 scripts/mooncake_lab.py --request-rate 50 \
+  --output ".local/mooncake-100rps/comparison-$(date +%Y%m%d-%H%M%S)"
+python3 scripts/mooncake_report.py .local/mooncake-100rps/<comparison-directory>
+python3 scripts/packed_probe.py --targets-per-role 40 --output .local/packed-probe.json
+```
+
+The replay uses every trace entry once, sequentially, at a constant offered
+RPS. Original timestamps are replaced, not replayed; order, lengths and shared
+prefix hashes come from the full trace. Mooncake's 512-token prefix blocks
+are distinct from the engine's 16-token cache pages. Chat templating adds
+tokens; server token counts and output-length mismatches remain in the results.
+Tool/agent traces represent inference traffic, not tool execution or quality.
+Requests set **root-level `ignore_eos: true`** to honor requested output
+lengths; no engine EOS-generation behavior is changed by this bundle.
+
+Default modes are KV-aware routing and `--load-aware`, with worker caches
+enabled in both. `--modes kv load-aware power-of-two` adds Po2C.
+Po2C chooses worker processes by in-flight requests, not individual DP-rank
+cache overlap; unpinned requests are distributed among fake-engine ranks
+locally. Dynamo uses synchronous prefill fallback in this mode, so it
+compares complete routing modes, not just worker-selection formulas.
+KV-specific routing controls do not apply to Po2C.
+
+**Mutating local experiment:** each case cold-restarts the frontend and
+configured workers. The runner temporarily changes DGD arguments, restores
+the original arguments in `finally`, and records restoration failures.
+Do not deploy concurrently or interrupt with an uncatchable process kill.
+Kubernetes commands explicitly target repo-local `.local/kubeconfig` and
+`kind-dynamo-sim`, never the host's default context. The packed probe needs the
+separate packed-worker/cache-metric changes and at least two ranks in a
+process; its pinned requests validate addressing, cache isolation and later
+unpinned cache-aware rank selection, not a throughput comparison.
+
+The reporter retains request/error accounting, CPU coverage and per-rank cache
+coverage. Cache snapshots missing entirely are unavailable; partial counters
+are rejected, missing ranks or fleet restarts suppress hit fractions.
+Regressing kubelet counters invalidate the affected role's CPU aggregate
+with an explicit warning and container identity. Incomplete CPU coverage is
+flagged, not presented as a full-run measurement. CPU is measured from
+cumulative container counters, with sample-time interpolation; do not sum node
+CPU values from kind nodes sharing one VM. Memory totals use contemporaneous
+complete batches, not a sum of each container's independent peak.
+
+Raw traces, deployment snapshots, logs and recorded dashboards may contain
+local metadata. Keep them under `.local/` and sanitize before sharing; none
+are committed here. These tools are offline-unit-tested; live performance and
+compatibility with the pending engine changes require a separate authorized run.
+
 ### Metrics, traces and logs
 
-The committed dashboard is a reproducible, offline-generated inference/cache/
-Planner overview with a live raw-metric explorer. It contains no captured
-host metrics or timestamps. Regenerate it without any running services:
+The committed dashboards are reproducible and offline-generated. The
+inference/cache/Planner overview includes a live raw-metric explorer, but no captured
+host metrics or timestamps. Regenerate both overview and routing-live JSON without services:
 
 ```bash
 python3 deploy/local/dashboard.py --offline

@@ -144,7 +144,7 @@ def test_observed_cache_panels_use_engine_counters_and_keep_layout_disjoint():
                     or a["y"] + a["h"] <= b["y"] or b["y"] + b["h"] <= a["y"])
 
 
-def test_offline_dashboard_is_reproducible_and_does_not_write_benchmark_files(tmp_path, monkeypatch):
+def test_offline_dashboards_are_reproducible(tmp_path, monkeypatch):
     output = tmp_path / "dashboard.json"
     monkeypatch.setattr(sys, "argv", ["dashboard.py", "--offline", "--output", str(output)])
 
@@ -157,4 +157,7 @@ def test_offline_dashboard_is_reproducible_and_does_not_write_benchmark_files(tm
     assert output.read_text() == expected
     committed = Path(dashboard.__file__).with_name("dashboard.json")
     assert committed.read_text() == expected
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["dashboard.json"]
+    live_expected = json.dumps(build_routing_live_dashboard(), separators=(",", ":")) + "\n"
+    assert (tmp_path / "routing-live-dashboard.json").read_text() == live_expected
+    assert committed.with_name("routing-live-dashboard.json").read_text() == live_expected
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dashboard.json", "routing-live-dashboard.json"]

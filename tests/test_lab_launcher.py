@@ -24,7 +24,7 @@ def test_missing_benchmark_commands_fail_before_cluster_access(tmp_path, command
         capture_output=True, text=True,
     )
     assert result.returncode == 1
-    assert "requires the separate traffic/benchmark follow-up" in result.stderr
+    assert "Missing benchmark script:" in result.stderr
     assert "unexpected tool invocation" not in result.stderr
 
 

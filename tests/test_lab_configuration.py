@@ -99,7 +99,7 @@ def test_lab_admission_controls_are_bounded_and_mounted():
 
 
 @pytest.mark.parametrize("section", [render.infrastructure, render.observability, render.dynamo])
-def test_lab_resources_render_without_benchmark_files(section):
+def test_lab_resources_render_with_benchmark_dashboards(section):
     resources = section()
     assert resources
     for item in resources:
@@ -113,10 +113,10 @@ def test_lab_resources_render_without_benchmark_files(section):
     assert json.loads(json.dumps(resources)) == resources
 
 
-def test_grafana_uses_generated_secret_and_only_the_lab_dashboard():
+def test_grafana_uses_generated_secret_and_both_lab_dashboards():
     resources = render.observability()
     dashboard = next(r for r in resources if r["metadata"]["name"] == "grafana-dashboard")
-    assert set(dashboard["data"]) == {"dynamo-lab.json"}
+    assert set(dashboard["data"]) == {"dynamo-lab.json", "dynamo-routing-live.json"}
     grafana = next(r for r in resources
                    if r["kind"] == "Deployment" and r["metadata"]["name"] == "grafana")
     env = grafana["spec"]["template"]["spec"]["containers"][0]["env"]

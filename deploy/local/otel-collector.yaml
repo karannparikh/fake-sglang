@@ -38,6 +38,57 @@ receivers:
             - source_labels: [__meta_kubernetes_pod_label_nvidia_com_dynamo_namespace]
               target_label: dynamo_namespace
           honor_labels: true
+        - &routing_experiment
+          job_name: routing-live-prefill-0
+          scrape_interval: 5s
+          scrape_timeout: 4s
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [dynamo-sim]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_label_app, __meta_kubernetes_pod_phase]
+              regex: "fake-routing-test;Running"
+              action: keep
+            - source_labels: [job]
+              regex: "routing-live-(.*)"
+              target_label: worker_slot
+            - source_labels: [job]
+              regex: "routing-live-(prefill|decode|frontend).*"
+              target_label: dynamo_component_type
+            - source_labels: [job]
+              regex: routing-live-prefill-0
+              target_label: __tmp_port
+              replacement: "9201"
+            - source_labels: [job]
+              regex: routing-live-prefill-1
+              target_label: __tmp_port
+              replacement: "9202"
+            - source_labels: [job]
+              regex: routing-live-decode-2
+              target_label: __tmp_port
+              replacement: "9203"
+            - source_labels: [job]
+              regex: routing-live-frontend
+              target_label: __tmp_port
+              replacement: "8000"
+            - source_labels: [__meta_kubernetes_pod_ip, __tmp_port]
+              regex: "(.+);(.+)"
+              target_label: __address__
+              replacement: "$$1:$$2"
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: kubernetes_namespace
+            - target_label: job
+              replacement: routing-experiment
+          honor_labels: true
+        - <<: *routing_experiment
+          job_name: routing-live-prefill-1
+        - <<: *routing_experiment
+          job_name: routing-live-decode-2
+        - <<: *routing_experiment
+          job_name: routing-live-frontend
         - job_name: dynamo-infrastructure
           scrape_interval: 10s
           static_configs:

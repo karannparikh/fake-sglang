@@ -14,7 +14,7 @@ fail() { echo "dynamo-sim: $*" >&2; exit 1; }
 
 require_benchmark_script() {
     [[ -f "$ROOT/$1" ]] ||
-        fail "$1 requires the separate traffic/benchmark follow-up; it is not part of the lab scaffold"
+        fail "Missing benchmark script: $1; restore the complete local benchmark bundle"
 }
 
 guard_cluster() {
@@ -184,6 +184,7 @@ case "${1:-status}" in
         python3 "$ROOT/deploy/local/dashboard.py"
         kubectl -n observability create configmap grafana-dashboard \
             --from-file=dynamo-lab.json="$ROOT/deploy/local/dashboard.json" \
+            --from-file=dynamo-routing-live.json="$ROOT/deploy/local/routing-live-dashboard.json" \
             --dry-run=client -o yaml | kubectl apply --server-side -f -
         ;;
     stop) colima stop --profile dynamo-sim ;;

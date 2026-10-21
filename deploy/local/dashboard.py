@@ -357,7 +357,7 @@ def build_dashboard(metadata, names):
             "in this catalog. Expand sections below the overview to see every family. "
             "Source and Instance filter the entire dashboard. The Raw metric explorer includes all live metric names, "
             "including histogram buckets, counts and sums, plus newly registered metrics.\n\n"
-            "Isolated routing experiments are excluded here.\n\n"
+            "Isolated routing experiments are excluded here; use the dedicated live experiment dashboard.\n\n"
             "**Simulation boundary:** engine timing, KV use and GPU-slot accounting are simulated. "
             "There is no physical GPU utilization, power or VRAM telemetry. SLA-regression and power-planning "
             "metrics are not calibrated for this lab. **No data** means no samples were emitted or the feature is inactive, not zero."
@@ -397,6 +397,10 @@ def build_dashboard(metadata, names):
         "templating": {"list": variables}, "panels": panels,
         "links": [
             {"title": "Prometheus", "type": "link", "url": "http://127.0.0.1:9090", "targetBlank": True},
+            {"title": "Recorded A/B experiments", "type": "dashboards",
+             "tags": ["routing-experiment"], "asDropdown": True, "keepTime": False},
+            {"title": "Live routing experiment", "type": "link",
+             "url": "http://127.0.0.1:3000/d/dynamo-routing-live", "keepTime": False},
         ],
     }
 
@@ -498,6 +502,9 @@ def main():
             raise RuntimeError("Prometheus has no metrics; refusing to replace the catalog")
     result = build_dashboard(metadata, names)
     args.output.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+    (args.output.parent / "routing-live-dashboard.json").write_text(
+        json.dumps(build_routing_live_dashboard(), separators=(",", ":")) + "\n",
+    )
     print(f"Generated {len(catalog(metadata, names))} metric families in {args.output}")
 
 
