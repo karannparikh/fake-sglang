@@ -116,6 +116,11 @@ class Scheduler:
     # -- submission --------------------------------------------------------
 
     def submit(self, request: Request) -> Request:
+        limit = min(self.config.total_kv_tokens, self.config.context_len)
+        if len(request.prompt_ids) > limit:
+            raise ValueError(
+                f"Prompt has {len(request.prompt_ids)} tokens; worker capacity is {limit}"
+            )
         self.by_rid[request.rid] = request
         self.waiting.append(request)
         self._wakeup.set()

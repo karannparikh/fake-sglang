@@ -120,6 +120,7 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     # --- fake-engine simulation knobs (not present in real SGLang) ---
     ("fake_prefill_ms_per_1k_tokens", "float", 55.0, None),
     ("fake_prefill_overhead_ms", "float", 4.0, None),
+    ("fake_kv_generation_ms_per_1k_tokens", "float", 0.0, None),
     ("fake_itl_ms", "float", 9.0, None),
     ("fake_itl_ms_per_running_req", "float", 0.35, None),
     ("fake_kv_bandwidth_gb_s", "float", 64.0, None),
