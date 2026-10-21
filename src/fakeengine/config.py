@@ -61,6 +61,12 @@ class SimConfig:
         page_size = _positive_int(server_args.page_size, "page_size")
         dcp_size = _positive_int(server_args.dcp_size, "dcp_size")
         block_size = page_size * dcp_size
+        dp_size = _positive_int(server_args.dp_size, "dp_size")
+        max_running = server_args.max_running_requests
+        if max_running is not None:
+            max_running = _positive_int(max_running, "max_running_requests")
+            if max_running % dp_size:
+                raise ValueError("max_running_requests must be divisible by dp_size")
 
         # A KV pool large enough that a laptop-scale smoke test never evicts,
         # but still finite so pressure and preemption are reachable on purpose.
@@ -95,7 +101,7 @@ class SimConfig:
             kv_bytes_per_token=model_config.kv_bytes_per_token(),
             block_size=block_size,
             num_kv_blocks=num_blocks,
-            max_running_requests=int(server_args.max_running_requests or 256),
+            max_running_requests=max_running // dp_size if max_running is not None else 256,
             max_batched_tokens=max_batched,
             prefill_ms_per_1k=float(server_args.fake_prefill_ms_per_1k_tokens),
             prefill_overhead_ms=float(server_args.fake_prefill_overhead_ms),
