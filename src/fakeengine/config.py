@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -44,6 +45,7 @@ class SimConfig:
     prefix_caching: bool = True
     location: Optional[str] = None
     topology: Optional[Topology] = None
+    kv_generation_ms_per_1k: float = 0.0
 
     @property
     def total_kv_tokens(self) -> int:
@@ -56,13 +58,22 @@ class SimConfig:
         # as the model's kv_cache_block_size and what the frontend uses to
         # chunk prompts before hashing. A mismatch means every published block
         # is silently dropped on the Rust side.
-        page_size = max(int(getattr(server_args, "page_size", 1) or 1), 1)
-        dcp_size = max(int(getattr(server_args, "dcp_size", 1) or 1), 1)
+        page_size = _positive_int(server_args.page_size, "page_size")
+        dcp_size = _positive_int(server_args.dcp_size, "dcp_size")
         block_size = page_size * dcp_size
 
         # A KV pool large enough that a laptop-scale smoke test never evicts,
         # but still finite so pressure and preemption are reachable on purpose.
-        num_blocks = max(int(server_args.fake_num_kv_blocks), 1)
+        num_blocks = _positive_int(server_args.fake_num_kv_blocks, "fake_num_kv_blocks")
+        if server_args.max_total_tokens is not None:
+            total_tokens = _positive_int(server_args.max_total_tokens, "max_total_tokens")
+            if total_tokens % block_size:
+                raise ValueError("max_total_tokens must be a multiple of page_size * dcp_size")
+            num_blocks = total_tokens // block_size
+
+        kv_generation_ms = float(server_args.fake_kv_generation_ms_per_1k_tokens)
+        if not math.isfinite(kv_generation_ms) or kv_generation_ms < 0:
+            raise ValueError("fake_kv_generation_ms_per_1k_tokens must be finite and nonnegative")
 
         max_batched = int(
             server_args.max_prefill_tokens
@@ -88,6 +99,7 @@ class SimConfig:
             max_batched_tokens=max_batched,
             prefill_ms_per_1k=float(server_args.fake_prefill_ms_per_1k_tokens),
             prefill_overhead_ms=float(server_args.fake_prefill_overhead_ms),
+            kv_generation_ms_per_1k=kv_generation_ms,
             itl_ms=float(server_args.fake_itl_ms),
             itl_ms_per_running_req=float(server_args.fake_itl_ms_per_running_req),
             kv_bandwidth_gb_s=float(server_args.fake_kv_bandwidth_gb_s),
@@ -119,7 +131,8 @@ def announce(config: SimConfig) -> None:
     logger.warning(
         "fake-sglang: SIMULATED engine -- no model weights, no real inference. "
         "mode=%s model=%s vocab=%d kv=%d blocks x %d tok "
-        "(%.1f KiB/token) prefill=%.1fms/1k itl=%.1fms xfer=%s speedup=%.2fx "
+        "(%.1f KiB/token) prefill=%.1fms/1k kv-generation=%.1fms/1k "
+        "itl=%.1fms xfer=%s speedup=%.2fx "
         "location=%s",
         config.disaggregation_mode,
         config.served_model_name,
@@ -128,6 +141,7 @@ def announce(config: SimConfig) -> None:
         config.block_size,
         config.kv_bytes_per_token / 1024,
         config.prefill_ms_per_1k,
+        config.kv_generation_ms_per_1k,
         config.itl_ms,
         "per-link topology"
         if config.topology is not None
@@ -135,3 +149,9 @@ def announce(config: SimConfig) -> None:
         config.speedup_ratio,
         config.location or "-",
     )
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value

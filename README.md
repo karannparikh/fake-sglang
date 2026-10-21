@@ -186,6 +186,7 @@ instead of adding the aggregated workers to the decode pool.
 |---|---|---|
 | `--fake-prefill-ms-per-1k-tokens` | 55.0 | Prefill cost per 1k recomputed tokens |
 | `--fake-prefill-overhead-ms` | 4.0 | Fixed per-prefill-step cost |
+| `--fake-kv-generation-ms-per-1k-tokens` | 0.0 | Additional K/V-generation cost for uncached prefill tokens |
 | `--fake-itl-ms` | 9.0 | Base inter-token latency |
 | `--fake-itl-ms-per-running-req` | 0.35 | ITL added per extra request in the batch |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
@@ -194,7 +195,21 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-num-kv-blocks` | 8192 | KV pool size; lower it to reach preemption |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
 | `--fake-location` | unset | This worker's place in the network, e.g. `zone-a/rack-1/node-2` |
-| `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the two `--fake-kv-*` knobs per transfer |
+| `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
+
+Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots.
+SGLang's standard `--max-total-tokens`, when supplied, takes precedence over
+the block count and must be positive and divisible by `page_size * dcp_size`.
+Block count, page size and DCP size must be positive integers.
+`--context-length` overrides the model's maximum sequence length independently
+of KV capacity. Prompts larger than either limit fail before queueing instead
+of waiting forever for impossible admission.
+
+The K/V-generation cost must be finite and nonnegative. It adds to the existing
+per-token prefill cost only for recomputed tokens, not cached prefixes or
+transferred KV on a prebuilt decode request. Each prefill step still pays its
+fixed overhead, and `--fake-speedup-ratio` divides the entire sleep.
+Decode and topology-dependent transfer costs are unchanged.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
