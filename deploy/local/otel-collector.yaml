@@ -1,0 +1,122 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: dynamo
+          scrape_interval: 5s
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [dynamo-sim]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              regex: "http|system|metrics"
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_label_nvidia_com_dynamo_component_type, __meta_kubernetes_pod_container_port_name]
+              regex: "frontend;system"
+              action: drop
+            - source_labels: [__meta_kubernetes_pod_phase]
+              regex: Running
+              action: keep
+            # Startup FPM registration holds the GIL; early Python metric callbacks
+            # can block Dynamo's runtime before worker initialization completes.
+            - source_labels: [__meta_kubernetes_pod_ready]
+              regex: "true"
+              action: keep
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: kubernetes_namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_label_nvidia_com_dynamo_component_type]
+              target_label: dynamo_component_type
+            - source_labels: [__meta_kubernetes_pod_label_nvidia_com_dynamo_namespace]
+              target_label: dynamo_namespace
+          honor_labels: true
+        - job_name: dynamo-infrastructure
+          scrape_interval: 10s
+          static_configs:
+            - targets: [etcd.dynamo-system.svc.cluster.local:2379]
+            - targets: [nats-exporter.dynamo-system.svc.cluster.local:7777]
+        - job_name: otel-collector-internal
+          scrape_interval: 10s
+          static_configs:
+            - targets: [127.0.0.1:8888]
+        - job_name: grafana
+          scrape_interval: 10s
+          static_configs:
+            - targets: [grafana:3000]
+        - job_name: tempo
+          scrape_interval: 10s
+          static_configs:
+            - targets: [tempo:3200]
+        - job_name: loki
+          scrape_interval: 10s
+          static_configs:
+            - targets: [loki:3100]
+        - job_name: dynamo-operator
+          scrape_interval: 10s
+          scheme: https
+          authorization:
+            credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+          tls_config:
+            # The operator generates a self-signed metrics certificate in this local lab.
+            insecure_skip_verify: true
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [dynamo-system]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              regex: "true"
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              regex: metrics
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 128
+  batch:
+    timeout: 1s
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    add_metric_suffixes: false
+    resource_to_telemetry_conversion:
+      enabled: true
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  telemetry:
+    metrics:
+      level: detailed
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]

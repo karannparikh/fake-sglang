@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: Dynamo lab
+    orgId: 1
+    folder: Dynamo
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

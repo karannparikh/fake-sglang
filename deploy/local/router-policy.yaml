@@ -1,0 +1,13 @@
+default_policy_family: lab
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: lab
+    policy_family: lab
+    cache_bucket: all
+    queue_policy: fcfs
+    quantum: 1
+    prefill_busy_threshold: 8192
+    request_queue_limit_per_worker: {request_queue_limit}
+    raw_isl_token_queue_limit_per_worker: {raw_token_queue_limit}

@@ -42,7 +42,205 @@ SGLang and never knows the difference.
 Aggregated and disaggregated modes produce **byte-identical output** for the
 same prompt, and both are reproducible run to run.
 
-## Setup
+## Local Kubernetes lab (Apple Silicon)
+
+The optional local lab runs the released **Dynamo 1.5.0 frontend, SGLang
+adapter, operator and Planner unchanged**, with only SGLang's engine replaced
+by this CPU simulator.
+
+**Integration dependencies:** this scaffold expects the separate simulator
+changes for configurable KV capacity/context and K/V-generation delay,
+observed cache metrics, forward-pass metrics (FPM), and packed data-parallel
+ranks. Those engine changes are not implemented by the lab files. Rendering
+manifests and regenerating the baseline dashboard work independently, but
+running this topology on an engine without those changes is not supported.
+The traffic and routing-benchmark utilities are a separate follow-up;
+`traffic`, `routing-test`, and `routing-dashboard` report an explicit error
+until their scripts are present. Benchmark dashboards and their observability
+wiring are not provisioned by this scaffold.
+
+```text
+OpenAI streaming traffic
+  -> Dynamo frontend / KV-aware router
+  -> dynamo.sglang prefill -> simulated KV handoff -> dynamo.sglang decode
+
+Kubernetes discovery + worker metadata <-> Dynamo operator / Planner
+NATS JetStream <-> Dynamo events, KV events and forward-pass telemetry
+
+Service /metrics -> OpenTelemetry Collector -> Prometheus -> Grafana
+Dynamo OTLP traces/logs -> Collector -> Tempo / Loki -> Grafana
+```
+
+The dedicated Colima profile and three-node kind cluster are both named
+`dynamo-sim`. They use 8 virtual CPUs, 24 GiB RAM and a 100 GiB virtual disk.
+Existing Docker/Kubernetes contexts are not activated or overwritten.
+Standalone etcd is also deployed and monitored, but active Dynamo discovery
+uses Kubernetes: its worker metadata supplies the Planner's KV capacity.
+The Colima VM uses the gRPC port forwarder so inference traffic does not
+share the SSH forwarding connection.
+
+### Start or resume
+
+Install prerequisites through Homebrew if needed:
+
+```bash
+brew install colima docker docker-buildx kind helm kubernetes-cli
+```
+
+The sibling `../dynamo` checkout must be NVIDIA's `v1.5.0` release. For a fresh
+workspace, clone it with
+`git clone --branch v1.5.0 --depth 1 https://github.com/ai-dynamo/dynamo.git`.
+Alternatively, set `DYNAMO_SOURCE` to an existing checkout at that release;
+the lab verifies the release commit and never changes its source.
+
+After integrating the engine dependencies above, from this repository:
+
+```bash
+bash deploy/local/lab.sh up
+bash deploy/local/lab.sh status
+```
+
+The first run builds a native ARM64 Linux image containing genuine Dynamo
+wheels and explicitly CPU-only PyTorch. Subsequent runs reuse it. No weights
+or remote model code are downloaded. Image dependencies are pinned in
+`deploy/local/requirements.txt`; the separate AIPerf requirements file is
+reserved for the benchmark follow-up and is not installed by the lab image.
+
+| Endpoint | URL |
+|---|---|
+| Inference API | http://127.0.0.1:8000 |
+| Metrics dashboard | http://127.0.0.1:3000/d/dynamo-local-sglang |
+| Prometheus | http://127.0.0.1:9090 |
+| OTLP gRPC | `127.0.0.1:4317` |
+| OTLP HTTP | http://127.0.0.1:4318 |
+
+Grafana's username is `dynamo`. Its generated password is in
+`.local/grafana-password` (mode 0600). `.local/` is ignored by Git and excluded
+from the Docker build context. Host ports bind only to localhost. This is a
+development lab, not a production-hardened deployment; the operator metrics
+scrape uses bearer authentication but skips verification of its locally
+generated certificate.
+
+### Worker topology and cache configuration
+
+The default topology is **40 prefill + 40 decode logical workers**, packed
+into four Python processes per role with ten data-parallel (DP) ranks per
+process. With the packed-rank engine changes, Dynamo routes to
+`(worker_id, dp_rank)`; each rank has its own scheduler, KV pool, cache events,
+scheduler load and FPM. Runtime imports and model metadata are shared.
+
+The real Planner receives FPM and evaluates load, but its four-endpoint
+minimum per role and eight-slot GPU budget pin the fleet at eight processes.
+The budget counts the single simulated GPU scheduling resource per process,
+not its ten logical ranks. `optimization_target=load` always enables load
+scaling in Dynamo, so disabling its boolean flag alone would not freeze the
+fleet. Each worker node advertises ten **simulated Kubernetes GPU resource
+slots**; each worker process requests one. These are opaque scheduling
+resources, not physical CUDA devices. `up` re-advertises them after restarts.
+
+Edit `deploy/local/lab-config.json`, then run
+`bash deploy/local/lab.sh deploy`. These settings apply to each fake prefill
+and decode worker; redeployment restarts affected workers and clears caches.
+
+| Setting | Local default | Meaning |
+|---|---|---|
+| `worker_processes_per_role` | 4 | Kubernetes worker pods per role |
+| `ranks_per_process` | 10 | Independent simulated workers per pod |
+| `context_length` | 131072 | Simulated maximum sequence length; not a real-model capability claim |
+| `kv_blocks_per_worker` | 8192 | Finite KV pool per logical worker |
+| `kv_block_size` | 16 | Token slots per block; default capacity is 131,072 tokens |
+| `publish_kv_events` | `true` | Publish retained prefixes and evictions to real Dynamo |
+| `kv_generation_ms_per_1k_tokens` | 50.0 | Additional modeled K/V-generation cost per 1,000 uncached tokens |
+
+The pool stores block metadata, not GPU KV tensors. Longer requests and more
+cached blocks still increase host-memory use; 131,072 slots do not guarantee
+that every concurrent request fits. The tokenizer/model configuration remains
+Qwen3-0.6B; the larger context is an explicit simulation-only override.
+
+The delay is additive to prefill cost and overhead, divided by
+`fake_speedup_ratio`. Reused prefixes and transferred decode KV incur no
+K/V-generation cost; recomputation after preemption is charged again.
+The engine's standalone default is zero; the lab deliberately sets 50 ms.
+Turning event publication off does not disable caching or observed-hit
+metrics. Both settings keep event-driven routing enabled rather than
+enabling Dynamo's approximate prediction of cache state from previous routes.
+
+`deploy/local/router-policy.yaml` is a renderer template using FCFS, an
+8,192-active-token prefill busy threshold, and per-logical-worker queue budgets
+of 10 requests and 65,536 raw input tokens. The renderer multiplies these by
+`ranks_per_process` because Dynamo scales budgets by process endpoints.
+Budgets apply per routing queue/policy class, not globally; executing requests
+are excluded and one accepted request can exceed the token budget. Each rank
+has eight running scheduler slots. For ten ranks, process-wide admission is
+80 engine requests plus 20 shared overflow requests. The frontend also uses
+an 85% active-decode-block threshold with output-block tracking. These are
+initial bounded lab settings, not production-calibrated limits.
+
+### Metrics, traces and logs
+
+The committed dashboard is a reproducible, offline-generated inference/cache/
+Planner overview with a live raw-metric explorer. It contains no captured
+host metrics or timestamps. Regenerate it without any running services:
+
+```bash
+python3 deploy/local/dashboard.py --offline
+python3 deploy/local/render.py infrastructure
+python3 deploy/local/render.py observability
+python3 deploy/local/render.py dynamo
+```
+
+After the lab has collected metrics, expand the persisted catalog from live
+Prometheus metadata:
+
+```bash
+bash deploy/local/lab.sh dashboard
+```
+
+This adds collapsed, type-aware sections for every discovered metric family
+while retaining the dashboard UID. Grafana picks up the ConfigMap update
+automatically. Source/Instance variables filter the dashboard. Counters show
+cumulative values and reset-aware rates; gauges show raw values; histograms
+show p50/p95/p99 and mean. No data means no samples or an inactive feature,
+not a fabricated zero. Tempo and Loki are also provisioned in Grafana Explore.
+
+Cache panels expect the separate engine metrics changes. Observed prefix-hit
+ratios use `sglang:simulated_prefix_cache_hit_tokens_total` divided by
+`sglang:simulated_prefix_cache_query_tokens_total`, with pod/DP-rank labels.
+Observations count initial prefill admission once, exclude transferred decode
+KV and health/warmup probes, and reset on worker restart. Idle windows have no
+defined ratio. The per-request histogram mean is not token-weighted, and router
+predictions count a different population. The separate backend-reported
+cached fraction includes transferred KV and is not cross-request prefix reuse.
+Resident/allocated/capacity and pressure-eviction panels use engine counters,
+not router event counts; explicit cache clears are shown separately.
+
+The collector scrapes Dynamo pods only after Kubernetes reports them Ready.
+This avoids a reproduced startup interaction between synchronous FPM relay
+construction (holding Python's GIL) and concurrent Python metrics callbacks.
+It is a **lab-side mitigation, not a fix to Dynamo's Rust bindings**; unready
+pods do not export scraped metrics through this collector.
+
+### Rebuild and stop
+
+```bash
+bash deploy/local/lab.sh rebuild  # test a new image, load it, then roll workers
+bash deploy/local/lab.sh deploy   # reapply worker config using the recorded image
+bash deploy/local/lab.sh stop     # stop only this Colima VM; preserve its data
+```
+
+The kubeconfig is `.local/kubeconfig`; use it explicitly for manual commands:
+
+```bash
+KUBECONFIG="$PWD/.local/kubeconfig" kubectl -n dynamo-sim get dgd,pods
+```
+
+Prometheus retains 48 hours of metrics (up to 3 GB); Tempo retains 24 hours
+of traces. Persistent volumes survive `stop`. The lab does not provide
+physical GPU utilization, CUDA/NCCL/RDMA execution, real KV tensors, Grove,
+Kai scheduling, snapshots, GPU power management or multi-tier KV offload.
+Simulated timings are not calibrated GPU benchmarks.
+
+## Native Python setup (alternative)
 
 Clone this repo next to a Dynamo checkout — the bootstrap script expects
 `../dynamo` and creates the shared virtualenv at `../.venv`:
@@ -98,7 +296,7 @@ MODEL=$PWD/models/<name> ./launch/agg.sh
 bumping the Qwen3 revision, update `QWEN3_0_6B_REVISION` in the script and
 `SOURCE.md` alongside the regenerated files.
 
-## Run
+## Run native processes
 
 No etcd, no NATS, no Docker — the launch scripts use Dynamo's file-based
 discovery backend (`DYN_DISCOVERY_BACKEND=file`) and a TCP request plane.

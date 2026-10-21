@@ -1,0 +1,6 @@
+ai-dynamo==1.5.0
+torch==2.9.0+cpu
+pillow==12.3.0
+blake3==1.0.10
+transformers==5.19.0
+numpy==2.2.6

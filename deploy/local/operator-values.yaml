@@ -1,0 +1,24 @@
+discoveryBackend: kubernetes
+etcdAddr: http://etcd.dynamo-system.svc.cluster.local:2379
+natsAddr: nats://nats.dynamo-system.svc.cluster.local:4222
+controllerManager:
+  manager:
+    image:
+      tag: "1.5.0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+dynamo:
+  metrics:
+    prometheusEndpoint: http://prometheus.observability.svc.cluster.local:9090
+    podMonitors:
+      enabled: false
+metricsService:
+  enabled: false
