@@ -44,6 +44,11 @@ same prompt, and both are reproducible run to run.
 
 ## Setup
 
+For the optional Apple Silicon Kubernetes lab, see the
+[local lab runbook](docs/local-lab.md). It requires lab/benchmark files and
+simulator integration changes not yet included in this fork's `main`; the
+runbook lists the prerequisites.
+
 Clone this repo next to a Dynamo checkout — the bootstrap script expects
 `../dynamo` and creates the shared virtualenv at `../.venv`:
 
