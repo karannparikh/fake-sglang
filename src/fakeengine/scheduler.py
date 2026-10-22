@@ -213,6 +213,8 @@ class Scheduler:
         await self._sleep_step(self.timing.prefill_ms(computed_tokens))
 
         for request in admitted:
+            if request.finished:
+                continue
             self._cache_prefix(request)
             self.running.append(request)
             self._emit_first_token(request)
@@ -267,13 +269,17 @@ class Scheduler:
         if not self.config.prefix_caching:
             return self.pool.can_allocate(1)
 
+        if request.blocks:
+            # A blocked first chunk already owns its cached references.
+            return request.cached_tokens == len(request.prompt_ids) or self.pool.can_allocate(1)
+
         # Acquire rather than merely match: the matched blocks become this
         # request's, shared with whoever else holds them, so the prefix costs
         # no new memory and cannot be evicted while in use.
         shared = self.pool.acquire_prefix(self._hashes_for(request))
         request.blocks.extend(shared)
         request.cached_tokens = len(shared) * self.config.block_size
-        return self.pool.can_allocate(1)
+        return request.cached_tokens == len(request.prompt_ids) or self.pool.can_allocate(1)
 
     def _grow_blocks(self, request: Request, token_capacity: int) -> bool:
         needed = math.ceil(token_capacity / self.config.block_size)

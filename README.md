@@ -237,6 +237,12 @@ Each worker publishes `BlockStored` / `BlockRemoved` events as its prefix cache
 changes. Dynamo's router subscribes, builds a radix tree per worker, and sends
 a request to whichever worker already holds the longest matching prefix.
 
+Unreferenced cached blocks are evicted in LRU **leaf-first** order: a parent
+cannot disappear while a reusable descendant remains. Referenced blocks cannot
+be evicted. Blocked admissions retain their acquired prefix references without
+reacquiring them, and closing or cancelling a generation stream releases its
+request's KV blocks.
+
 The subtlety worth knowing: Dynamo treats the published `block_hashes` as
 **opaque engine ids** and recomputes its own prefix key from the published
 `token_ids` (`lib/kv-router/src/zmq_wire/convert.rs`). So the token payload has
