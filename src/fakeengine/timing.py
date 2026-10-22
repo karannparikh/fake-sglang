@@ -27,7 +27,14 @@ class TimingModel:
 
     def prefill_ms(self, num_tokens: int) -> float:
         cfg = self.config
-        return cfg.prefill_overhead_ms + (num_tokens / 1000.0) * cfg.prefill_ms_per_1k
+        return (
+            cfg.prefill_overhead_ms
+            + (num_tokens / 1000.0) * cfg.prefill_ms_per_1k
+            + self.kv_generation_ms(num_tokens)
+        )
+
+    def kv_generation_ms(self, uncached_tokens: int) -> float:
+        return uncached_tokens * self.config.kv_generation_ms_per_1k / 1000.0
 
     def decode_step_ms(self, running_requests: int) -> float:
         """One decode step for the whole batch.
