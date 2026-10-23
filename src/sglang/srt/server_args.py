@@ -109,6 +109,7 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("enable_memory_saver", "flag", False, None),
     ("enable_forward_pass_metrics", "flag", False, None),
     ("forward_pass_metrics_ipc_name", "str", None, None),
+    ("forward_pass_metrics_worker_id", "str", None, None),
     ("kv_events_config", "str", None, None),
     # Honored: no prefix reuse and no BlockStored events, as in SGLang.
     ("disable_radix_cache", "flag", False, None),
