@@ -72,6 +72,20 @@ def _str_args(value, where: str) -> List[str]:
     raise ConfigError(f"{where}: args must be a list or a string, got {value!r}")
 
 
+def _dp_size(args: List[str], where: str) -> int:
+    parser = argparse.ArgumentParser(
+        add_help=False, allow_abbrev=False, exit_on_error=False,
+    )
+    parser.add_argument("--dp-size", type=int, default=1)
+    try:
+        parsed, _ = parser.parse_known_args(args)
+    except argparse.ArgumentError as exc:
+        raise ConfigError(f"{where}: {exc}") from exc
+    if parsed.dp_size < 1:
+        raise ConfigError(f"{where}: --dp-size must be a positive integer")
+    return parsed.dp_size
+
+
 def build(
     config: dict, extra_args: List[str], python: str, port_offset: int = 0
 ) -> List[Proc]:
@@ -110,7 +124,7 @@ def build(
     counters = {role: itertools.count() for role in ROLES}
     system_ports = itertools.count(SYSTEM_PORT_BASE + port_offset)
     bootstrap_ports = itertools.count(BOOTSTRAP_PORT_BASE + port_offset)
-    kv_ports = itertools.count(KV_EVENTS_PORT_BASE + port_offset)
+    next_kv_port = KV_EVENTS_PORT_BASE + port_offset
     have = set()
 
     for i, group in enumerate(workers_cfg):
@@ -139,6 +153,8 @@ def build(
         group_args = _str_args(defaults.get("args"), "defaults") + _str_args(
             group.get("args"), where
         )
+        worker_args = group_args + extra_args
+        dp_size = _dp_size(worker_args, where)
         for _ in range(count):
             n = next(counters[role])
             name = f"{group.get('name') or role}-{n}"
@@ -157,12 +173,21 @@ def build(
                 ports["bootstrap"] = next(bootstrap_ports)
                 argv += ["--disaggregation-bootstrap-port", str(ports["bootstrap"])]
             if kv_events:
-                ports["kv_events"] = next(kv_ports)
+                if next_kv_port < 1 or next_kv_port + dp_size - 1 > 65535:
+                    raise ConfigError(
+                        f"{name}: KV-event port range "
+                        f"{next_kv_port}-{next_kv_port + dp_size - 1} "
+                        "must be within 1-65535"
+                    )
+                ports["kv_events"] = next_kv_port
+                for rank in range(1, dp_size):
+                    ports[f"kv_events_rank_{rank}"] = next_kv_port + rank
+                next_kv_port += dp_size
                 endpoint = f"tcp://*:{ports['kv_events']}"
                 argv += ["--kv-events-config", json.dumps({"publisher": "zmq", "endpoint": endpoint})]
             if location:
                 argv += ["--fake-location", location, "--fake-topology", topology_json]
-            argv += group_args + extra_args
+            argv += worker_args
 
             env = {"DYN_SYSTEM_PORT": str(ports["system"])}
             env.update({str(k): str(v) for k, v in (group.get("env") or {}).items()})
@@ -178,13 +203,18 @@ def build(
 
 def check_ports(procs: List[Proc]) -> None:
     taken = []
+    owners = {}
     for proc in procs:
         for kind, port in proc.ports.items():
+            owner = f"{proc.name} {kind} :{port}"
+            if port in owners:
+                raise ConfigError(f"port assigned twice: {owners[port]} and {owner}")
+            owners[port] = owner
             with socket.socket() as sock:
                 try:
                     sock.bind(("0.0.0.0", port))
                 except OSError:
-                    taken.append(f"{proc.name} {kind} :{port}")
+                    taken.append(owner)
     if taken:
         raise ConfigError(
             "ports already in use (is another launch still running?):\n  "

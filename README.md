@@ -219,7 +219,11 @@ grep -h "KV room" runs/1/decode-*.log | grep -o "over '[a-z]*'" | sort | uniq -c
 
 At startup the launcher prints the placement and the link that each
 prefill → decode pair would use. Ports are assigned automatically. Use
-`--port-offset N` to run a cluster beside another deployment. Each run gets
+`--dp-size N --enable-dp-attention` in worker arguments to pack ranks;
+the cluster launcher assigns each worker a consecutive range of N KV-event
+ports and checks every rank's port before starting the cluster. The final
+`--dp-size` value wins across defaults, group arguments, and CLI overrides.
+Use `--port-offset N` to run a cluster beside another deployment. Each run gets
 its own discovery registry (`DYN_FILE_KV`), so concurrent runs never discover
 each other's workers.
 
@@ -273,8 +277,9 @@ KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 ```
 
 Dynamo derives `use_kv_events` from that same config, so one flag turns on both
-the engine's publishing and Dynamo's subscription. Give each worker its own
-port.
+the engine's publishing and Dynamo's subscription. When assigning ports
+manually, give each worker a non-overlapping range of `dp_size` ports starting
+at its configured endpoint.
 
 ## How disaggregation flows
 

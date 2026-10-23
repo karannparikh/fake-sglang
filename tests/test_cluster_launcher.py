@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -83,6 +85,122 @@ def test_port_offset_and_arg_layering():
     tail = worker.argv[-6:]
     assert tail == ["--fake-itl-ms", "5", "--fake-speedup-ratio", "2", "--fake-num-kv-blocks", "64"]
     assert _flag(worker, "--kv-events-config") is None    # no kv router, no events
+
+
+@pytest.mark.parametrize("extra, sizes", [
+    ([], [2, 2, 3]),
+    (["--dp-size", "4"], [4, 4, 4]),
+    (["--dp-size=5"], [5, 5, 5]),
+    (["--dp-size", "4", "--dp-size=1"], [1, 1, 1]),
+])
+def test_packed_workers_get_disjoint_port_ranges_after_arg_overrides(extra, sizes):
+    procs, _ = _build({
+        "frontend": {"router_mode": "kv"},
+        "defaults": {"args": "--dp-size 2 --enable-dp-attention"},
+        "workers": [
+            {"role": "agg", "count": 2},
+            {"role": "agg", "args": ["--dp-size=3", "--fake-itl-ms", "5"]},
+        ],
+    }, extra=extra, offset=100)
+    next_port = cluster.KV_EVENTS_PORT_BASE + 100
+    for worker, size in zip(procs[1:], sizes):
+        rank_ports = {
+            key: value for key, value in worker.ports.items() if key.startswith("kv_events")
+        }
+        assert rank_ports == {
+            ("kv_events" if rank == 0 else f"kv_events_rank_{rank}"): next_port + rank
+            for rank in range(size)
+        }
+        endpoint = json.loads(_flag(worker, "--kv-events-config"))["endpoint"]
+        assert endpoint == f"tcp://*:{next_port}"
+        next_port += size
+
+
+@pytest.mark.parametrize("args", [
+    ["--dp-size", "0"], ["--dp-size=-1"], ["--dp-size", "two"],
+    ["--dp-size"], ["--dp-size", "--enable-dp-attention"],
+])
+def test_invalid_dp_size_fails_during_planning(args):
+    with pytest.raises(cluster.ConfigError, match="workers\\[0\\].*--dp-size"):
+        _build({"workers": [{"role": "agg"}]}, extra=args)
+
+
+def test_packed_kv_port_range_cannot_exceed_tcp_port_limit():
+    with pytest.raises(cluster.ConfigError, match="65535-65536.*1-65535"):
+        _build({
+            "frontend": {"router_mode": "kv"},
+            "workers": [{"role": "agg", "args": "--dp-size 2 --enable-dp-attention"}],
+        }, offset=65535 - cluster.KV_EVENTS_PORT_BASE)
+
+
+def test_check_ports_checks_nonzero_rank_ports():
+    with socket.socket() as occupied:
+        occupied.bind(("0.0.0.0", 0))
+        port = occupied.getsockname()[1]
+        procs, _ = _build({
+            "frontend": {"router_mode": "kv"},
+            "workers": [{"role": "agg", "args": "--dp-size 2 --enable-dp-attention"}],
+        }, offset=port - 1 - cluster.KV_EVENTS_PORT_BASE)
+        with pytest.raises(cluster.ConfigError, match=f"agg-0 kv_events_rank_1 :{port}"):
+            cluster.check_ports(procs)
+
+
+def test_check_ports_rejects_duplicate_assignments(unused_port):
+    procs = [
+        cluster.Proc("first", [], ports={"kv_events_rank_1": unused_port}),
+        cluster.Proc("second", [], ports={"kv_events": unused_port}),
+    ]
+    with pytest.raises(cluster.ConfigError, match="port assigned twice: first.*second"):
+        cluster.check_ports(procs)
+
+
+@pytest.fixture
+def kv_port_base():
+    for _ in range(20):
+        with ExitStack() as cleanup:
+            first = cleanup.enter_context(socket.socket())
+            first.bind(("127.0.0.1", 0))
+            base = first.getsockname()[1]
+            if base + 4 > 65535:
+                continue
+            try:
+                for port in range(base + 1, base + 5):
+                    sock = cleanup.enter_context(socket.socket())
+                    sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return base
+    pytest.fail("Could not reserve five consecutive KV-event ports")
+
+
+async def test_packed_workers_bind_all_assigned_tcp_ports(server_args, kv_port_base):
+    from sglang import Engine
+
+    procs, _ = _build({
+        "frontend": {"router_mode": "kv"},
+        "workers": [
+            {"role": "agg", "args": "--dp-size 2 --enable-dp-attention"},
+            {"role": "agg", "args": "--dp-size 3 --enable-dp-attention"},
+        ],
+    }, offset=kv_port_base - cluster.KV_EVENTS_PORT_BASE)
+    engines = []
+    try:
+        for worker, size in zip(procs[1:], (2, 3)):
+            engine = Engine(server_args(
+                dp_size=size, enable_dp_attention=True,
+                kv_events_config=_flag(worker, "--kv-events-config"),
+            ))
+            engines.append(engine)
+            expected = [
+                port for key, port in worker.ports.items() if key.startswith("kv_events")
+            ]
+            assert [
+                event._publisher._endpoint for event in engine._rank_events
+            ] == [f"tcp://*:{port}" for port in expected]
+        assert len(engines) == 2
+    finally:
+        for engine in engines:
+            await engine._async_shutdown()
 
 
 @pytest.mark.parametrize(
