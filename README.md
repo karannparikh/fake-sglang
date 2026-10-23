@@ -99,6 +99,10 @@ on every rank. Abort and cache-flush controls cover all ranks.
 
 ## Setup
 
+For a step-by-step guide to the native macOS launchers included in this
+repository, see the [local lab runbook](docs/local-lab.md). It covers setup,
+local requests, configuration, and shutdown without Kubernetes or Docker.
+
 Clone this repo next to a Dynamo checkout — the bootstrap script expects
 `../dynamo` and creates the shared virtualenv at `../.venv`:
 
