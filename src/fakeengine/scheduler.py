@@ -129,16 +129,20 @@ class Scheduler:
     async def stop(self) -> None:
         self._stopping = True
         self._wakeup.set()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+        finally:
             self._task = None
-        if self.fpm is not None:
-            self.fpm.close()
-            self.fpm = None
+            for rid in list(self.by_rid):
+                self.abort(rid)
+            if self.fpm is not None:
+                self.fpm.close()
+                self.fpm = None
 
     # -- submission --------------------------------------------------------
 

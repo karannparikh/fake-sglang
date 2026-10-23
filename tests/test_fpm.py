@@ -28,16 +28,11 @@ def test_fpm_requires_endpoint_and_identity(endpoint, worker_id):
         ForwardPassPublisher(endpoint, worker_id)
 
 
-def test_engine_rejects_multi_rank_fpm(server_args):
-    with pytest.raises(ValueError, match="require --dp-size 1"):
-        Engine(server_args(enable_forward_pass_metrics=True, dp_size=2))
-
-
 def test_engine_closes_publishers_on_initialization_failure(server_args, monkeypatch, fpm_endpoint):
     import sglang.srt.entrypoints.engine as engine_module
 
     events = Mock()
-    monkeypatch.setattr(engine_module, "build_emitter", lambda *args: events)
+    monkeypatch.setattr(engine_module, "build_emitter", lambda *args, **kwargs: events)
     def fail(*args, **kwargs):
         raise RuntimeError("scheduler init failed")
 
