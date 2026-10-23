@@ -24,6 +24,33 @@ def _kv_config(port: int) -> str:
     return json.dumps({"publisher": "zmq", "endpoint": f"tcp://*:{port}"})
 
 
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_engine_rejects_ipc_kv_endpoint_before_creating_publisher(
+    server_args, monkeypatch, dp_size,
+):
+    def unexpected_publisher(*args, **kwargs):
+        pytest.fail("IPC configuration must fail before creating a publisher")
+
+    monkeypatch.setattr("fakeengine.kv_events.ZmqEventPublisher", unexpected_publisher)
+    with pytest.raises(ValueError, match="IPC endpoints.*--kv-events-config.*TCP"):
+        Engine(server_args(
+            dp_size=dp_size,
+            enable_dp_attention=dp_size > 1,
+            kv_events_config=json.dumps({
+                "publisher": "zmq", "endpoint": "ipc:///tmp/fake-kv-events",
+            }),
+        ))
+
+
+def test_disabled_kv_publisher_ignores_ipc_endpoint(server_args):
+    from fakeengine.kv_events import NullKvEventEmitter, build_emitter
+
+    emitter = build_emitter(server_args(kv_events_config=json.dumps({
+        "publisher": "null", "endpoint": "ipc:///tmp/fake-kv-events",
+    })), BLOCK_SIZE)
+    assert isinstance(emitter, NullKvEventEmitter)
+
+
 class Subscriber:
     """A stand-in for the Rust KvEventPublisher's ZMQ subscription."""
 

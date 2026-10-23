@@ -79,6 +79,9 @@ Each rank owns its scheduler, prefix cache, counters, KV-event publisher,
 FPM endpoint, and scheduler-metrics stream. Prometheus observations carry
 the `dp_rank` label. KV events use the configured TCP port plus the rank;
 scheduler metrics share Dynamo's IPC endpoint and carry `data_parallel_rank`.
+IPC endpoints in `--kv-events-config` are rejected, including in single-rank
+mode; use a TCP endpoint such as `tcp://*:25557`. This restriction does not
+apply to FPM or scheduler-metrics IPC channels.
 
 KV capacity and the prefill budget are **per rank**. An explicit
 `--max-running-requests` is a process-wide budget, must be positive and

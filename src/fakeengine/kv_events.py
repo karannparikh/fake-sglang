@@ -166,6 +166,11 @@ def build_emitter(server_args, block_size: int, dp_rank: int = 0):
     endpoint = config.get("endpoint")
     if not endpoint:
         raise ValueError("--kv-events-config sets a publisher but no 'endpoint'")
+    if endpoint.startswith("ipc://"):
+        raise ValueError(
+            "fake-sglang does not support IPC endpoints in --kv-events-config; "
+            "use a TCP endpoint such as tcp://*:25557 for per-rank port offsets"
+        )
 
     return KvEventEmitter(
         block_size=block_size,
