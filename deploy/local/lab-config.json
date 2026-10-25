@@ -1,0 +1,9 @@
+{
+  "worker_processes_per_role": 4,
+  "ranks_per_process": 10,
+  "context_length": 131072,
+  "kv_blocks_per_worker": 8192,
+  "kv_block_size": 16,
+  "publish_kv_events": true,
+  "kv_generation_ms_per_1k_tokens": 50.0
+}

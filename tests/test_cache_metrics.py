@@ -264,23 +264,39 @@ def test_engine_metrics_reach_genuine_dynamo_callback():
             enable_metrics=True, page_size=4, fake_speedup_ratio=200,
         ))
         callbacks = []
+        typed_callbacks = []
         endpoint = SimpleNamespace(
-            metrics=SimpleNamespace(register_prometheus_expfmt_callback=callbacks.append),
+            metrics=SimpleNamespace(
+                register_prometheus_expfmt_callback=callbacks.append,
+                register_prometheus_typed_callback=typed_callbacks.append,
+            ),
             connection_id=lambda: 123,
         )
         config = SimpleNamespace(dynamo_args=SimpleNamespace(
             namespace="test", component="prefill", endpoint="generate",
         ))
         setup_prometheus_registry(engine, endpoint, config)
+        assert len(callbacks) == len(typed_callbacks) == 1
         from prometheus_client.parser import text_string_to_metric_families
 
         def samples():
-            return {
+            data = {
                 sample.name: sample
                 for family in text_string_to_metric_families(callbacks[0]())
                 for sample in family.samples
                 if not sample.name.endswith("_bucket")
             }
+            typed = {
+                name: (dict(labels), value)
+                for _, _, _, _, family_samples in typed_callbacks[0]()
+                for name, labels, value, _ in family_samples
+                if name.startswith(prefix) and not name.endswith("_bucket")
+            }
+            assert typed == {
+                name: (sample.labels, sample.value)
+                for name, sample in data.items() if name.startswith(prefix)
+            }
+            return data
 
         prefix = "sglang:simulated_prefix_cache_"
         assert samples()[prefix + "query_tokens_total"].value == 0
