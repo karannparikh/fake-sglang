@@ -1,17 +1,17 @@
 # Local Dynamo + fake-SGLang lab
 
 An operating guide for an Apple Silicon macOS Kubernetes lab using genuine
-Dynamo 1.5.0 with a CPU-only simulated SGLang engine. No model weights are
+Dynamo 1.6.0 with a CPU-only simulated SGLang engine. No model weights are
 needed. Simulation timings and logical GPU slots are not measurements of
 GPU hardware.
 
 ## Prerequisite status
 
 **This is documentation for the assembled Kubernetes lab, not an installation
-provided by this documentation branch alone.** The engine baseline below
-contains lifecycle cleanup, KV configuration, observed telemetry, and packed
-DP ranks. The lab scaffold and benchmark scripts are published separately
-on `karparik-linkedin-personal-fork-lab-pr`, not on `main`.
+provided by this documentation branch alone.** The complete, tested source
+is published separately on `karparik/dynamo-1.6-lab`. It combines the engine,
+deployment scaffold, and benchmark scripts in one pinned revision; merging
+this documentation does not install those files on `main`.
 
 Use an isolated source checkout containing all of these prerequisites:
 
@@ -33,46 +33,36 @@ Do not switch branches or update a checkout that owns an active lab.
 
 ### Obtain a complete source checkout
 
-These revisions identify the engine and lab configuration described here:
+Use these revisions for the rebuilt lab:
 
 | Input | Pinned revision | Contents |
 |---|---|---|
-| Engine baseline | [`20c9fae91e79812b6e7a7cb0c4924da725604e25`](https://github.com/karannparikh/fake-sglang/commit/20c9fae91e79812b6e7a7cb0c4924da725604e25) | `main` snapshot with the required simulator features |
-| Lab bundle | [`9bad220c5bdbce70ea302af3acc61d0b3b23d957`](https://github.com/karannparikh/fake-sglang/tree/9bad220c5bdbce70ea302af3acc61d0b3b23d957) | Deployment scaffold, dashboards, benchmark tools, and lab tests |
-| Dynamo source | [`b83b1d9304ebfc624709ac46db32b1b6f1ff1615`](https://github.com/ai-dynamo/dynamo/commit/b83b1d9304ebfc624709ac46db32b1b6f1ff1615), tag `v1.5.0` | Operator chart and CRDs required by the launcher |
+| Complete lab | [`c54d3bb54dc2cff8d33510bb0fbc69ef26b7c436`](https://github.com/karannparikh/fake-sglang/commit/c54d3bb54dc2cff8d33510bb0fbc69ef26b7c436) | Engine, deployment scaffold, dashboards, benchmark tools, and tests |
+| Dynamo source | [`701da25292ecca8f64d770cc0b17d389200019a1`](https://github.com/ai-dynamo/dynamo/commit/701da25292ecca8f64d770cc0b17d389200019a1), tag `v1.6.0` | Matching operator chart; operator image manages CRDs |
 
-The lab branch is based on an older engine, and merging it directly into
-this engine baseline conflicts in the README. In a **new clone**, retain the
-engine baseline and copy only the lab additions and local-state ignore rules:
+Create a **new clone** rather than switching the checkout of a running lab:
 
 ```bash
 set -euo pipefail
 git clone https://github.com/karannparikh/fake-sglang.git fake-sglang-k8s
 cd fake-sglang-k8s
 
-ENGINE_REV=20c9fae91e79812b6e7a7cb0c4924da725604e25
-LAB_REV=9bad220c5bdbce70ea302af3acc61d0b3b23d957
-git fetch origin karparik-linkedin-personal-fork-lab-pr
+LAB_REV=c54d3bb54dc2cff8d33510bb0fbc69ef26b7c436
+git fetch origin karparik/dynamo-1.6-lab
 git cat-file -e "$LAB_REV^{commit}"
-git switch --create local-k8s-lab "$ENGINE_REV"
-
-git diff --name-only --diff-filter=A "$ENGINE_REV" "$LAB_REV" \
-  -- .dockerignore deploy/local scripts tests \
-  | git restore --source="$LAB_REV" --worktree --pathspec-from-file=-
-git restore --source="$LAB_REV" --worktree -- .gitignore
+git switch --create local-k8s-lab "$LAB_REV"
+test "$(git rev-parse HEAD)" = "$LAB_REV"
 git status --short
 ```
 
-This creates a composite working tree with 39 added lab files and a modified
-`.gitignore`; it intentionally leaves them uncommitted. It does not replace
-`src/`, `pyproject.toml`, `launch/`, or the engine tests with older versions.
-Keep both revision IDs with your experiment records. Do not use this recipe
-to overwrite an existing working checkout.
-
-Source assembly is not a claim that a clean image build passes. Read the
-source-version compatibility warning under **Fresh installation** before
-starting the lab; this documentation PR does not fix those implementation
-prerequisites.
+The resulting source tree is committed and clean; no manual file copying is
+needed. Its provenance is engine baseline
+[`20c9fae`](https://github.com/karannparikh/fake-sglang/commit/20c9fae91e79812b6e7a7cb0c4924da725604e25)
+plus the lab additions from
+[`9bad220`](https://github.com/karannparikh/fake-sglang/commit/9bad220c5bdbce70ea302af3acc61d0b3b23d957),
+followed by the Dynamo 1.6.0 compatibility fixes. Do not substitute the older
+lab branch: it predates engine changes and does not contain the rebuild fixes.
+Keep the complete-lab and Dynamo revision IDs with experiment records.
 
 ## Choose the operation
 
@@ -219,29 +209,27 @@ normal package-management process; Git and Python 3 must also be available:
 
 ```bash
 brew install colima docker docker-buildx kind helm kubernetes-cli
-git clone --branch v1.5.0 --depth 1 \
-  https://github.com/ai-dynamo/dynamo.git ../dynamo-v1.5.0
-export DYNAMO_SOURCE="$(cd ../dynamo-v1.5.0 && pwd)"
+git clone --branch v1.6.0 --depth 1 \
+  https://github.com/ai-dynamo/dynamo.git ../dynamo-v1.6.0
+export DYNAMO_SOURCE="$(cd ../dynamo-v1.6.0 && pwd)"
 test "$(git -C "$DYNAMO_SOURCE" rev-parse HEAD)" = \
-  b83b1d9304ebfc624709ac46db32b1b6f1ff1615
+  701da25292ecca8f64d770cc0b17d389200019a1
 ```
 
 Run this from the complete fake-SGLang source root and use a new clone
 destination; do not repurpose another working Dynamo checkout. Set
 `DYNAMO_SOURCE` again in new terminals. This host checkout supplies operator
-resources; the container installs `ai-dynamo==1.5.0` separately.
+resources; the container installs `ai-dynamo==1.6.0` separately. The operator
+and Planner also use 1.6.0 images.
 
 The build runs the full image test suite before loading the image into kind
-or recording it. **The pinned source inputs are not a verified passing clean
-build.** Check `tests/test_shim_contract.py` against the pinned Dynamo version:
-`test_deliberately_absent_list_is_current` checks guarded imports, while
-`test_dynamo_sees_cache_salt_support` expects
-`dynamo.sglang._compat.cache_salt_kwargs`, which is absent from the pinned
-Dynamo 1.5.0 source. Reconcile the source-version contracts before a fresh
-installation; do not suppress tests or delete a working lab to bypass the
-gate. An existing running image does not prove that a clean rebuild passes.
+or recording it. The complete-lab revision includes the missing `httpx`
+dependency and the Dynamo 1.6.0 metrics-callback test adaptation, which checks
+both typed and text metric values. The original shim-contract tests remain
+unchanged: 1.6.0 supplies the optional imports and `cache_salt_kwargs` missing
+from 1.5.0. Do not suppress failures or reuse an untested image.
 
-After resolving the source compatibility prerequisites:
+For a first installation, proceed directly to:
 
 ```bash
 bash deploy/local/lab.sh up
@@ -253,6 +241,9 @@ bash deploy/local/lab.sh status
 a three-node kind cluster with `kindest/node:v1.35.0`. It advertises simulated
 GPU slots, applies infrastructure, **restarts observability deployments**,
 installs the operator, builds or reuses an image, and deploys the graph.
+The operator's `crd-apply` init container owns CRD installation and upgrades
+(`upgradeCRD: true`). The launcher waits for CRDs after Helm completes; do not
+also apply the raw source CRDs, which conflicts with operator-owned fields.
 State is checkout-local under `.local/`; this is not a harmless health check.
 
 The launcher requires Apple Silicon macOS and uses VZ/aarch64 with Colima's
@@ -260,6 +251,7 @@ gRPC port forwarder. Ensure the host can spare the VM allocation. Profile,
 cluster names, and host ports are fixed: do not start another checkout against
 an existing lab on the same machine. Host CLI versions are not pinned by
 the launcher; record the versions used when reproducing an issue.
+The rebuild used Colima 0.10.3, kind 0.33.0, Helm 4.3.1 and kubectl 1.34.4.
 
 The container and services are defined in the pinned Dockerfile, requirements,
 operator values, and `render.py`. The image uses Python 3.10 and CPU-only
@@ -269,6 +261,49 @@ the `fake-sglang` DynamoGraphDeployment lives in `dynamo-sim`, and monitoring
 lives in `observability`.
 Infrastructure is created before image tests, so a failed build can leave a
 partially provisioned cluster; preserve the failure output and inspect it.
+
+### Reset an existing dedicated lab
+
+This is optional and destructive, not a routine restart. First stop any
+benchmark or probe and preserve host-side artifacts you need. Confirm the
+`dynamo-sim` profile is the lab you intend to remove:
+
+```bash
+colima status --profile dynamo-sim
+docker --context colima-dynamo-sim ps
+colima delete --profile dynamo-sim --data
+```
+
+The final command asks for confirmation and removes this VM's container
+runtime data, including kind nodes, images, Kubernetes volumes, and monitoring
+history. It does not delete host source checkouts or their benchmark files.
+Do not run an unscoped Colima deletion or remove another profile.
+
+Use the new pinned source checkout above, set `DYNAMO_SOURCE`, and run
+`bash deploy/local/lab.sh up`. Its fresh `.local/` will receive a new
+kubeconfig, generated Grafana credential and tested image marker. Do not copy
+an old kubeconfig or image marker into it.
+
+### Rebuild verification
+
+On October 25, 2026, the old dedicated VM and container data were removed,
+then the VM, three-node cluster, and services were recreated. Resolving the
+initial 1.5.0 build failures required upgrading the new cluster to 1.6.0;
+the working source above incorporates those fixes.
+
+| Check | Result |
+|---|---|
+| New 1.6.0 image, complete `tests/` suite | 350 passed; no skipped compatibility tests |
+| Runtime, operator, Planner | All 1.6.0 |
+| Inference topology | Four Ready prefill, four Ready decode, one frontend, one Planner |
+| Streaming smoke run | 32 requests, concurrency eight, zero failures |
+| Packed-rank probe | 40 targets per role; 131,072 token slots per rank; cache isolation and KV-aware rank selection passed |
+| Infrastructure | Operator, etcd, NATS and NATS exporter Ready |
+| Observability | Grafana, Prometheus, collector, Tempo and Loki Ready; service health endpoints responded |
+
+This verifies the rebuilt lab and bounded inference probes, not a rerun of
+the full six-case Mooncake benchmark or an end-to-end trace/log delivery audit.
+The benchmark procedure below is retained for separate, exclusive runs.
 
 ## Prepare the benchmark inputs
 
@@ -406,9 +441,16 @@ Run only outside measured experiments, with the intended topology:
 
 ```bash
 bash deploy/local/lab.sh traffic --requests 32 --concurrency 8
+sleep 15
 python3.13 scripts/packed_probe.py \
   --targets-per-role 40 --output .local/packed-probe.json
 ```
+
+Let traffic finish and metrics settle before starting the probe. The
+collector and Prometheus each scrape every five seconds; the pause covers
+both hops and batching under normal load. Under collection delays, confirm
+the counters have settled first. A stale pre-probe baseline can misattribute
+earlier traffic's hits to the probe's cold rank.
 
 The probe checks rank addressing, capacity and cache isolation and changes
 cache contents. `bash deploy/local/lab.sh routing-test` is a different,
