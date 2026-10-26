@@ -264,8 +264,12 @@ def test_engine_metrics_reach_genuine_dynamo_callback():
             enable_metrics=True, page_size=4, fake_speedup_ratio=200,
         ))
         callbacks = []
+        typed_callbacks = []
         endpoint = SimpleNamespace(
-            metrics=SimpleNamespace(register_prometheus_expfmt_callback=callbacks.append),
+            metrics=SimpleNamespace(
+                register_prometheus_expfmt_callback=callbacks.append,
+                register_prometheus_typed_callback=typed_callbacks.append,
+            ),
             connection_id=lambda: 123,
         )
         config = SimpleNamespace(dynamo_args=SimpleNamespace(
