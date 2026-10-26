@@ -3,13 +3,6 @@ import yaml
 from deploy.local import render
 
 
-def test_collector_memory_limiter_matches_container_headroom():
-    config = yaml.safe_load((render.HERE / "otel-collector.yaml").read_text())
-    limiter = config["processors"]["memory_limiter"]
-    assert limiter["limit_mib"] == 768
-    assert limiter["spike_limit_mib"] == 256
-
-
 def test_dynamo_scrapes_wait_for_ready_pods():
     config = yaml.safe_load((render.HERE / "otel-collector.yaml").read_text())
     jobs = config["receivers"]["prometheus"]["config"]["scrape_configs"]

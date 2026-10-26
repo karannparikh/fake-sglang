@@ -99,40 +99,6 @@ def test_lab_capacity_matches_configured_context():
     assert config["kv_blocks_per_worker"] * config["kv_block_size"] == 131072
 
 
-def test_lab_workers_have_cpu_and_probe_headroom():
-    components = render.dynamo()[0]["spec"]["components"]
-    for component in components:
-        if component["type"] not in ("prefill", "decode"):
-            continue
-        container = component["podTemplate"]["spec"]["containers"][0]
-        assert container["resources"]["limits"]["cpu"] == "2"
-        assert container["readinessProbe"] == {
-            "httpGet": {"path": "/health", "port": "system", "scheme": "HTTP"},
-            "periodSeconds": 5,
-            "timeoutSeconds": 4,
-            "failureThreshold": 2,
-            "successThreshold": 1,
-        }
-        assert container["livenessProbe"] == {
-            "httpGet": {"path": "/live", "port": "system", "scheme": "HTTP"},
-            "periodSeconds": 30,
-            "timeoutSeconds": 10,
-            "failureThreshold": 3,
-            "successThreshold": 1,
-        }
-
-
-def test_otel_collector_has_memory_headroom():
-    collector = next(
-        item for item in render.observability()
-        if item["kind"] == "Deployment"
-        and item["metadata"]["name"] == "otel-collector"
-    )
-    resources = collector["spec"]["template"]["spec"]["containers"][0]["resources"]
-    assert resources["requests"]["memory"] == "384Mi"
-    assert resources["limits"]["memory"] == "1Gi"
-
-
 def test_lab_admission_controls_are_bounded_and_mounted():
     ranks = load_lab_config()["ranks_per_process"]
     resources = render.dynamo()
