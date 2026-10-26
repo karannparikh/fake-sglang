@@ -112,7 +112,7 @@ def build(
 
     router_mode = frontend_cfg.get("router_mode")
     kv_events = frontend_cfg.get("kv_events", router_mode == "kv")
-    page_size = int(defaults.get("page_size", 16 if kv_events else 1))
+    page_size = int(defaults.get("page_size", 256))
 
     http_port = int(frontend_cfg.get("http_port", 8000)) + port_offset
     frontend_argv = [python, "-m", "dynamo.frontend", "--http-port", str(http_port)]
