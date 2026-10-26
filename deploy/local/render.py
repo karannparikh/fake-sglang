@@ -2,6 +2,7 @@
 """Render the isolated CPU lab's Kubernetes resources as a JSON List."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -334,7 +335,20 @@ def dynamo():
                 },
             },
         })
+    policy = configmap(
+        "lab-router-policy", "dynamo-sim", {"router-policy.yaml": "router-policy.yaml"},
+    )
+    policy["data"]["router-policy.yaml"] = policy["data"]["router-policy.yaml"].format(
+        request_queue_limit=10 * ranks, raw_token_queue_limit=65536 * ranks,
+    )
+    policy_digest = hashlib.sha256(
+        policy["data"]["router-policy.yaml"].encode()
+    ).hexdigest()
     for component in components:
+        annotations = component["podTemplate"].setdefault("metadata", {}).setdefault(
+            "annotations", {}
+        )
+        annotations["dynamo-sim.local/router-policy-sha256"] = policy_digest
         pod = component["podTemplate"]["spec"]
         container = pod["containers"][0]
         container["args"] += ["--router-policy-config", "/etc/lab-router/router-policy.yaml"]
@@ -380,12 +394,6 @@ def dynamo():
                            "nvidia.com/dynamo-component-type": "frontend"},
               "ports": [{"name": "http", "port": 8000, "targetPort": 8000,
                          "nodePort": 30800}]},
-    )
-    policy = configmap(
-        "lab-router-policy", "dynamo-sim", {"router-policy.yaml": "router-policy.yaml"},
-    )
-    policy["data"]["router-policy.yaml"] = policy["data"]["router-policy.yaml"].format(
-        request_queue_limit=10 * ranks, raw_token_queue_limit=65536 * ranks,
     )
     return [dgd, frontend_service, policy]
 

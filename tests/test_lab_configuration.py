@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -104,9 +105,13 @@ def test_lab_admission_controls_are_bounded_and_mounted():
     policy = next(r for r in resources if r["kind"] == "ConfigMap")
     assert f"request_queue_limit_per_worker: {10 * ranks}" in policy["data"]["router-policy.yaml"]
     assert f"raw_isl_token_queue_limit_per_worker: {65536 * ranks}" in policy["data"]["router-policy.yaml"]
+    policy_digest = hashlib.sha256(policy["data"]["router-policy.yaml"].encode()).hexdigest()
     for component in resources[0]["spec"]["components"]:
         if component["type"] == "planner":
             continue
+        assert component["podTemplate"]["metadata"]["annotations"][
+            "dynamo-sim.local/router-policy-sha256"
+        ] == policy_digest
         pod = component["podTemplate"]["spec"]
         container = pod["containers"][0]
         assert "--router-policy-config" in container["args"]
