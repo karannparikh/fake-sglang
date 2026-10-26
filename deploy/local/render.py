@@ -41,7 +41,7 @@ def service(name, namespace, ports):
 
 def workload(name, namespace, image, ports, *, command=None, args=None, config=None,
              storage=None, env=None, health=None, service_account=None,
-             mounts=None, memory="512Mi"):
+             mounts=None, memory="512Mi", memory_request="96Mi"):
     volumes = []
     volume_mounts = []
     items = []
@@ -70,7 +70,7 @@ def workload(name, namespace, image, ports, *, command=None, args=None, config=N
     container = {
         "name": name, "image": image,
         "ports": [{"name": key, "containerPort": port} for key, port, _ in ports],
-        "resources": {"requests": {"cpu": "50m", "memory": "96Mi"},
+        "resources": {"requests": {"cpu": "50m", "memory": memory_request},
                       "limits": {"cpu": "1", "memory": memory}},
         "volumeMounts": volume_mounts,
         "securityContext": {
@@ -174,6 +174,7 @@ def observability():
         args=["--config=/etc/otel-collector.yaml"],
         config=("otel-collector.yaml", "/etc/otel-collector.yaml"),
         health=(13133, "/"), service_account="otel-collector",
+        memory="1Gi", memory_request="384Mi",
     )
     items += workload(
         "prometheus", ns, "prom/prometheus:v3.4.1", [("http", 9090, 30909)],
@@ -328,8 +329,22 @@ def dynamo():
                         "resources": {
                             "requests": {"cpu": "100m", "memory": "256Mi",
                                          "nvidia.com/gpu": "1"},
-                            "limits": {"cpu": "1", "memory": "1Gi",
+                            "limits": {"cpu": "2", "memory": "1Gi",
                                        "nvidia.com/gpu": "1"},
+                        },
+                        "readinessProbe": {
+                            "httpGet": {
+                                "path": "/health", "port": "system", "scheme": "HTTP",
+                            },
+                            "periodSeconds": 5, "timeoutSeconds": 4,
+                            "failureThreshold": 2, "successThreshold": 1,
+                        },
+                        "livenessProbe": {
+                            "httpGet": {
+                                "path": "/live", "port": "system", "scheme": "HTTP",
+                            },
+                            "periodSeconds": 30, "timeoutSeconds": 10,
+                            "failureThreshold": 3, "successThreshold": 1,
                         },
                     }],
                 },
