@@ -83,11 +83,13 @@ IPC endpoints in `--kv-events-config` are rejected, including in single-rank
 mode; use a TCP endpoint such as `tcp://*:25557`. This restriction does not
 apply to FPM or scheduler-metrics IPC channels.
 
-KV capacity and the prefill budget are **per rank**. The default worker profile
-models one 8-GPU H200 instance: 15,509 blocks of 256 tokens (3,970,304 token
-slots), a 1,048,576-token context, 32 concurrent requests, and FP8 E4M3 KV
-storage. These are accounting and timing settings only; no GPU-sized tensor
-buffers are allocated on the host. An explicit
+KV capacity and the prefill budget are **per rank**. The default rank profile
+models the KV limits of one 8-GPU H200 instance: 15,509 blocks of 256 tokens
+(3,970,304 token slots), a 1,048,576-token context, 32 concurrent requests,
+and FP8 E4M3 KV storage. With the default `dp_size=1`, one worker process has
+one such rank. A packed worker with `dp_size=N` creates N independent pools
+with this capacity, one per rank. These are accounting and timing settings
+only; no GPU-sized tensor buffers are allocated on the host. An explicit
 `--max-running-requests` is a process-wide budget, must be positive and
 divisible by `dp_size`, and is split equally; when omitted it defaults to
 32 slots per rank. For example, `--dp-size 10 --max-running-requests 80
@@ -414,6 +416,9 @@ pytest ../dynamo/components/src/dynamo/sglang/tests -m unit      # 1006 pass, 7 
 ```
 
 Counts are against Dynamo `2db5333ef6`.
+The `Tests` GitHub Actions workflow checks out that revision, builds its
+CPU-compatible Python binding, and runs this repository's complete suite with
+the Dynamo source paths configured so integration tests cannot silently skip.
 
 `tests/test_shim_contract.py` is the drift guard. It reads Dynamo's own source
 and fails by name when Dynamo starts using something the shim lacks: every
