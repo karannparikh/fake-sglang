@@ -9,6 +9,10 @@ def server_args():
         base = dict(
             model_path="stub-model",
             served_model_name="stub-model",
+            # Most unit tests use short prompts and exercise block behavior at
+            # token granularity rather than the production-sized default.
+            page_size=1,
+            fake_num_kv_blocks=8192,
             # Compress the clock hard: these tests assert ordering and ratios,
             # not wall-clock latency, and a real-time sleep model would make
             # the suite take minutes.

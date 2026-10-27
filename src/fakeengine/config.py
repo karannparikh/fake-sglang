@@ -98,10 +98,12 @@ class SimConfig:
             disaggregation_mode=server_args.disaggregation_mode or "null",
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
-            kv_bytes_per_token=model_config.kv_bytes_per_token(),
+            kv_bytes_per_token=model_config.kv_bytes_per_token(
+                dtype_bytes=1 if server_args.kv_cache_dtype.startswith("fp8") else 2
+            ),
             block_size=block_size,
             num_kv_blocks=num_blocks,
-            max_running_requests=max_running // dp_size if max_running is not None else 256,
+            max_running_requests=max_running // dp_size if max_running is not None else 32,
             max_batched_tokens=max_batched,
             prefill_ms_per_1k=float(server_args.fake_prefill_ms_per_1k_tokens),
             prefill_overhead_ms=float(server_args.fake_prefill_overhead_ms),

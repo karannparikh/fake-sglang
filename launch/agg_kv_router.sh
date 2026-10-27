@@ -15,7 +15,7 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 require_model
 
-PAGE_SIZE="${PAGE_SIZE:-16}"
+PAGE_SIZE="${PAGE_SIZE:-256}"
 KV_PORT_A="${KV_PORT_A:-25557}"
 KV_PORT_B="${KV_PORT_B:-25657}"
 

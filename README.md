@@ -83,10 +83,16 @@ IPC endpoints in `--kv-events-config` are rejected, including in single-rank
 mode; use a TCP endpoint such as `tcp://*:25557`. This restriction does not
 apply to FPM or scheduler-metrics IPC channels.
 
-KV capacity and the prefill budget are **per rank**. An explicit
+KV capacity and the prefill budget are **per rank**. The default rank profile
+models the KV limits of one 8-GPU H200 instance: 15,509 blocks of 256 tokens
+(3,970,304 token slots), a 1,048,576-token context, 32 concurrent requests,
+and FP8 E4M3 KV storage. With the default `dp_size=1`, one worker process has
+one such rank. A packed worker with `dp_size=N` creates N independent pools
+with this capacity, one per rank. These are accounting and timing settings
+only; no GPU-sized tensor buffers are allocated on the host. An explicit
 `--max-running-requests` is a process-wide budget, must be positive and
 divisible by `dp_size`, and is split equally; when omitted it defaults to
-256 slots per rank. For example, `--dp-size 10 --max-running-requests 80
+32 slots per rank. For example, `--dp-size 10 --max-running-requests 80
 --fake-num-kv-blocks 8192 --page-size 16` gives each rank 131,072 KV token
 slots and eight running-request slots.
 
@@ -251,12 +257,13 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
-| `--fake-num-kv-blocks` | 8192 | KV pool size; lower it to reach preemption |
+| `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
 | `--fake-location` | unset | This worker's place in the network, e.g. `zone-a/rack-1/node-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
 
-Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots.
+Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots. The
+default `--page-size` is 256 and the default `--context-length` is 1,048,576.
 SGLang's standard `--max-total-tokens`, when supplied, takes precedence over
 the block count and must be positive and divisible by `page_size * dcp_size`.
 Block count, page size and DCP size must be positive integers.
@@ -409,6 +416,9 @@ pytest ../dynamo/components/src/dynamo/sglang/tests -m unit      # 1006 pass, 7 
 ```
 
 Counts are against Dynamo `2db5333ef6`.
+The `Tests` GitHub Actions workflow checks out that revision, builds its
+CPU-compatible Python binding, and runs this repository's complete suite with
+the Dynamo source paths configured so integration tests cannot silently skip.
 
 `tests/test_shim_contract.py` is the drift guard. It reads Dynamo's own source
 and fails by name when Dynamo starts using something the shim lacks: every

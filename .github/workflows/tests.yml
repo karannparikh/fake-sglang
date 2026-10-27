@@ -1,0 +1,77 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out fake-sglang
+        uses: actions/checkout@v5
+        with:
+          path: fake-sglang
+
+      - name: Check out compatible Dynamo
+        uses: actions/checkout@v5
+        with:
+          repository: ai-dynamo/dynamo
+          ref: 2db5333ef63401fe259676b26db59869626bc725
+          path: dynamo
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: fake-sglang/pyproject.toml
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            dynamo/target
+          key: ${{ runner.os }}-dynamo-${{ hashFiles('dynamo/Cargo.lock') }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+
+      - name: Install Python dependencies
+        working-directory: fake-sglang
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --editable '.[dev]'
+          python -m pip install 'maturin>=1,<2' 'transformers>=4.56.0'
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build Dynamo Python binding
+        working-directory: dynamo/lib/bindings/python
+        run: |
+          maturin build \
+            --no-default-features \
+            --interpreter python \
+            --out "${{ github.workspace }}/dist"
+          python -m pip install "${{ github.workspace }}"/dist/*.whl
+
+      - name: Run full suite
+        working-directory: fake-sglang
+        env:
+          DYNAMO_SGLANG_PATH: ${{ github.workspace }}/dynamo/components/src/dynamo/sglang
+          PYTHONPATH: ${{ github.workspace }}/dynamo/components/src
+        run: python -m pytest -q

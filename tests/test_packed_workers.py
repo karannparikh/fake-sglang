@@ -67,7 +67,7 @@ async def test_packed_capacity_is_per_rank(server_args):
     config = SimConfig.from_server_args(args)
     assert config.max_running_requests == 8
     assert config.total_kv_tokens == 131072
-    assert SimConfig.from_server_args(server_args(dp_size=10)).max_running_requests == 256
+    assert SimConfig.from_server_args(server_args(dp_size=10)).max_running_requests == 32
     engine = Engine(args)
     try:
         assert len(engine.schedulers) == 10

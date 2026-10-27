@@ -16,7 +16,7 @@ frontend:
   args: []
 
 defaults:                         # applied to every worker
-  page_size: 16
+  page_size: 256
   args: []                        # e.g. [--fake-itl-ms, 12]
 
 # A location is one path component per level, outermost first. A transfer

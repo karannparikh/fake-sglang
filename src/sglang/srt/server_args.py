@@ -34,7 +34,8 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("chat_template", "str", None, None),
     ("revision", "str", None, None),
     ("dtype", "str", "auto", None),
-    ("context_length", "int", None, None),
+    ("kv_cache_dtype", "str", "fp8_e4m3", ("auto", "fp8_e4m3", "fp8_e5m2")),
+    ("context_length", "int", 1_048_576, None),
     ("load_format", "str", "auto", ("auto", "dummy", "safetensors", "pt", "remote_instance")),
     # Dynamo routes ModelExpress weight loading on these two; the fake loads no
     # weights, so they are accepted and recorded only.
@@ -76,7 +77,7 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("max_prefill_tokens", "int", 8192, None),
     ("chunked_prefill_size", "int", 8192, None),
     ("mem_fraction_static", "float", 0.9, None),
-    ("page_size", "int", 1, None),
+    ("page_size", "int", 256, None),
     ("schedule_policy", "str", "fcfs", None),
     ("schedule_conservativeness", "float", 1.0, None),
     ("stream_interval", "int", 1, None),
@@ -127,7 +128,7 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("fake_kv_bandwidth_gb_s", "float", 64.0, None),
     ("fake_kv_transfer_overhead_ms", "float", 1.0, None),
     ("fake_speedup_ratio", "float", 1.0, None),
-    ("fake_num_kv_blocks", "int", 8192, None),
+    ("fake_num_kv_blocks", "int", 15_509, None),
     ("fake_bootstrap_poll_interval_ms", "float", 5.0, None),
     ("fake_bootstrap_timeout_s", "float", 30.0, None),
     # Network placement: this worker's location path and the cluster-wide link

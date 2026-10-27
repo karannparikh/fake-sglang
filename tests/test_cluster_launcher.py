@@ -87,6 +87,11 @@ def test_port_offset_and_arg_layering():
     assert _flag(worker, "--kv-events-config") is None    # no kv router, no events
 
 
+def test_default_worker_page_size_matches_h200_profile():
+    procs, _ = _build({"workers": [{"role": "agg"}]})
+    assert _flag(procs[1], "--page-size") == "256"
+
+
 @pytest.mark.parametrize("extra, sizes", [
     ([], [2, 2, 3]),
     (["--dp-size", "4"], [4, 4, 4]),

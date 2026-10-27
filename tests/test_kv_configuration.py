@@ -8,7 +8,7 @@ from fakeengine.scheduler import Request, Scheduler
 from fakeengine.timing import TimingModel
 from fakeengine.topology import Link
 from sglang.srt.entrypoints.engine import _SchedulerInitResult
-from sglang.srt.server_args import prepare_server_args
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 
 
 @pytest.mark.parametrize("field", [
@@ -55,6 +55,28 @@ def test_block_capacity_and_zero_generation_cost_remain_defaults(server_args):
     assert config.kv_generation_ms_per_1k == 0
     assert TimingModel(config).prefill_ms(1000) == (
         config.prefill_overhead_ms + config.prefill_ms_per_1k
+    )
+
+
+def test_default_worker_profile_matches_h200_experiment():
+    args = ServerArgs(model_path="stub-model", served_model_name="stub-model")
+    config = SimConfig.from_server_args(args)
+
+    assert config.block_size == 256
+    assert config.num_kv_blocks == 15_509
+    assert config.total_kv_tokens == 3_970_304
+    assert config.context_len == 1_048_576
+    assert config.max_running_requests == 32
+    assert config.kv_bytes_per_token == args.get_model_config().kv_bytes_per_token(
+        dtype_bytes=1
+    )
+
+
+def test_non_fp8_kv_cache_uses_two_byte_elements(server_args):
+    args = server_args(kv_cache_dtype="auto")
+    config = SimConfig.from_server_args(args)
+    assert config.kv_bytes_per_token == args.get_model_config().kv_bytes_per_token(
+        dtype_bytes=2
     )
 
 
