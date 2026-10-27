@@ -16,6 +16,7 @@ on a peer that is never coming.
 from __future__ import annotations
 
 import logging
+import secrets
 from typing import Any, Dict, Optional
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, KVPoll
@@ -129,10 +130,18 @@ class KVSender:
     """Prefill-side sender for one request. Publishing the room *is* the send:
     the decode peer's poll is what observes it."""
 
-    def __init__(self, config: SimConfig, server, bootstrap_room: int) -> None:
+    def __init__(
+        self,
+        config: SimConfig,
+        server,
+        bootstrap_room: int,
+        *,
+        dp_rank: int,
+    ) -> None:
         self.config = config
         self.server = server
         self.room = int(bootstrap_room)
+        self.dp_rank = int(dp_rank)
         self.state = KVPoll.Bootstrapping
 
     def poll(self) -> int:
@@ -149,6 +158,7 @@ class KVSender:
             kv_bytes=num_tokens * self.config.kv_bytes_per_token,
             first_token=first_token,
             location=self.config.location,
+            kv_return=self._return_ticket(),
         )
         self.state = KVPoll.Success
 
@@ -156,3 +166,19 @@ class KVSender:
         self.state = KVPoll.Failed
         if self.server is not None:
             self.server.fail_room(self.room, reason)
+
+    def _return_ticket(self) -> Optional[Dict[str, Any]]:
+        if not (
+            self.config.enable_kv_return
+            and self.config.disaggregation_mode == "prefill"
+            and self.config.prefix_caching
+        ):
+            return None
+        return {
+            "version": self.config.kv_return_protocol_version,
+            "enabled": True,
+            "nonce": secrets.token_urlsafe(24),
+            "prefill_dp_rank": self.dp_rank,
+            "max_return_tokens": self.config.kv_return_max_tokens,
+            "deadline_ms": self.config.kv_return_deadline_ms,
+        }

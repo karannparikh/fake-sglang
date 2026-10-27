@@ -13,6 +13,7 @@ from fakeengine.topology import Topology, load as load_topology
 logger = logging.getLogger(__name__)
 
 _BANNER_SHOWN = False
+KV_RETURN_PROTOCOL_VERSION = 1
 
 
 @dataclass
@@ -35,6 +36,13 @@ class SimConfig:
     itl_ms_per_running_req: float
     kv_bandwidth_gb_s: float
     kv_transfer_overhead_ms: float
+    enable_kv_return: bool
+    kv_return_protocol_version: int
+    kv_return_max_tokens: int
+    kv_return_deadline_ms: float
+    kv_return_bytes_per_token: int
+    kv_return_bandwidth_gb_s: float
+    kv_return_overhead_ms: float
     speedup_ratio: float
 
     bootstrap_host: Optional[str]
@@ -92,15 +100,65 @@ class SimConfig:
         if topology is not None and location is not None:
             topology.parse_location(location)  # fail at startup, not mid-transfer
 
+        kv_bytes_per_token = model_config.kv_bytes_per_token(
+            dtype_bytes=1 if server_args.kv_cache_dtype.startswith("fp8") else 2
+        )
+        kv_bandwidth_gb_s = _positive_finite_float(
+            server_args.fake_kv_bandwidth_gb_s,
+            "fake_kv_bandwidth_gb_s",
+        )
+        kv_transfer_overhead_ms = _positive_finite_float(
+            server_args.fake_kv_transfer_overhead_ms,
+            "fake_kv_transfer_overhead_ms",
+        )
+        bootstrap_timeout_s = _positive_finite_float(
+            server_args.fake_bootstrap_timeout_s,
+            "fake_bootstrap_timeout_s",
+        )
+
+        return_bytes = getattr(server_args, "fake_kv_return_bytes_per_token", None)
+        if return_bytes is None:
+            return_bytes = kv_bytes_per_token
+        else:
+            return_bytes = _positive_int(
+                return_bytes,
+                "fake_kv_return_bytes_per_token",
+            )
+
+        return_bandwidth = getattr(server_args, "fake_kv_return_bandwidth_gb_s", None)
+        if return_bandwidth is None:
+            return_bandwidth = kv_bandwidth_gb_s
+        else:
+            return_bandwidth = _positive_finite_float(
+                return_bandwidth,
+                "fake_kv_return_bandwidth_gb_s",
+            )
+
+        return_overhead = getattr(server_args, "fake_kv_return_overhead_ms", None)
+        if return_overhead is None:
+            return_overhead = kv_transfer_overhead_ms
+        else:
+            return_overhead = _positive_finite_float(
+                return_overhead,
+                "fake_kv_return_overhead_ms",
+            )
+
+        return_deadline = getattr(server_args, "fake_kv_return_deadline_ms", None)
+        if return_deadline is None:
+            return_deadline = bootstrap_timeout_s * 1000.0
+        else:
+            return_deadline = _positive_finite_float(
+                return_deadline,
+                "fake_kv_return_deadline_ms",
+            )
+
         return cls(
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
             disaggregation_mode=server_args.disaggregation_mode or "null",
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
-            kv_bytes_per_token=model_config.kv_bytes_per_token(
-                dtype_bytes=1 if server_args.kv_cache_dtype.startswith("fp8") else 2
-            ),
+            kv_bytes_per_token=kv_bytes_per_token,
             block_size=block_size,
             num_kv_blocks=num_blocks,
             max_running_requests=max_running // dp_size if max_running is not None else 32,
@@ -110,8 +168,18 @@ class SimConfig:
             kv_generation_ms_per_1k=kv_generation_ms,
             itl_ms=float(server_args.fake_itl_ms),
             itl_ms_per_running_req=float(server_args.fake_itl_ms_per_running_req),
-            kv_bandwidth_gb_s=float(server_args.fake_kv_bandwidth_gb_s),
-            kv_transfer_overhead_ms=float(server_args.fake_kv_transfer_overhead_ms),
+            kv_bandwidth_gb_s=kv_bandwidth_gb_s,
+            kv_transfer_overhead_ms=kv_transfer_overhead_ms,
+            enable_kv_return=bool(getattr(server_args, "enable_kv_return", False)),
+            kv_return_protocol_version=KV_RETURN_PROTOCOL_VERSION,
+            kv_return_max_tokens=_positive_int(
+                getattr(server_args, "fake_kv_return_max_tokens", 4096),
+                "fake_kv_return_max_tokens",
+            ),
+            kv_return_deadline_ms=return_deadline,
+            kv_return_bytes_per_token=return_bytes,
+            kv_return_bandwidth_gb_s=return_bandwidth,
+            kv_return_overhead_ms=return_overhead,
             speedup_ratio=max(float(server_args.fake_speedup_ratio), 1e-6),
             bootstrap_host=None,
             bootstrap_port=int(server_args.disaggregation_bootstrap_port or 8998),
@@ -119,7 +187,7 @@ class SimConfig:
                 server_args.fake_bootstrap_poll_interval_ms
             )
             / 1000.0,
-            bootstrap_timeout_s=float(server_args.fake_bootstrap_timeout_s),
+            bootstrap_timeout_s=bootstrap_timeout_s,
             prefix_caching=not bool(getattr(server_args, "disable_radix_cache", False)),
             location=location,
             topology=topology,
@@ -163,3 +231,15 @@ def _positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _positive_finite_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite and positive")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite and positive") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    return number
