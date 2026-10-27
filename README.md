@@ -182,6 +182,50 @@ Any flag is forwarded to the workers, so you can dial the simulation:
 ./launch/disagg.sh --fake-kv-bandwidth-gb-s 1 --fake-itl-ms 25
 ```
 
+## Focused Dynamo 1.6 routing lab
+
+`deploy/local/` provides an isolated Apple Silicon lab using Colima and kind.
+It pins the Dynamo runtime, operator, Planner, and Helm chart to Dynamo 1.6,
+then runs the fake engine in a disaggregated topology with one frontend, one
+Planner, four prefill processes x 10 DP ranks, and four decode processes x 10
+DP ranks. The workers inherit this repository's H200 application defaults:
+15,509 blocks x 256 tokens, 3,970,304 token slots, a 1,048,576-token context,
+FP8 E4M3 accounting, and 32 running requests per rank.
+
+Check out the pinned Dynamo revision next to this repository, then create the
+lab:
+
+```bash
+git -C ../dynamo checkout 701da25292ecca8f64d770cc0b17d389200019a1
+bash deploy/local/lab.sh up
+```
+
+Place the validated Mooncake workloads at
+`.local/mooncake-100rps/conversation_trace.jsonl` and
+`.local/mooncake-100rps/toolagent_trace.jsonl`. The setup command installs the
+pinned AIPerf environment and tokenizer cache; the benchmark records each
+trace's SHA-256 in its invocation metadata.
+
+```bash
+bash deploy/local/lab.sh benchmark-setup
+bash deploy/local/lab.sh benchmark --output .local/runs/mooncake-routing
+```
+
+The default is the complete two-workload x three-routing matrix at 20 offered
+RPS: KV-aware, load-aware, and PO2C (`power-of-two` in the Dynamo CLI).
+Override the load with `--request-rate`. Before every case the harness recreates
+the frontend, Planner, and all workers, requires fresh UIDs and exact readiness,
+settles for 15 seconds, validates the model/context, and monitors UIDs and
+restart counts throughout traffic. Cache reuse uses direct per-run counter
+deltas for the new prefill pods, so stale Prometheus series cannot contribute.
+A run succeeds only when AIPerf completion, zero-error accounting, fleet
+stability, and all six expected cases pass. `summary.json` and `report.md` are
+written under the selected output directory; `.local/` is ignored by git.
+
+The lab includes only Prometheus and the OpenTelemetry collector needed by the
+benchmark. It intentionally omits Grafana dashboards, manual traffic tools,
+scenario generators, and probe utilities.
+
 ## Clusters and network topology
 
 `launch/cluster.sh` runs any mix of workers from a YAML file: how many prefill,

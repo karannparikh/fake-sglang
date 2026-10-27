@@ -23,3 +23,6 @@ htmlcov/
 .idea/
 *.swp
 .DS_Store
+
+# Local Kubernetes lab state, benchmark dependencies, and generated artifacts
+.local/
