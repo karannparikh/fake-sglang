@@ -259,6 +259,8 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
+| `--fake-output-len-median` | unset | Median natural answer length in tokens; unset = every request runs to `max_new_tokens` |
+| `--fake-output-len-sigma` | 1.0 | Lognormal shape of the natural answer length |
 | `--fake-location` | unset | This worker's place in the network, e.g. `zone-a/rack-1/node-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
 
@@ -276,6 +278,16 @@ per-token prefill cost only for recomputed tokens, not cached prefixes or
 transferred KV on a prebuilt decode request. Each prefill step still pays its
 fixed overhead, and `--fake-speedup-ratio` divides the entire sleep.
 Decode and topology-dependent transfer costs are unchanged.
+
+With `--fake-output-len-median` set, each answer also has a natural length,
+drawn from a lognormal with that median and `--fake-output-len-sigma`. The
+mean is `median * exp(sigma^2 / 2)`, so median 150 and sigma 1.47 give a mean
+of about 442 tokens. The draw is seeded by the prompt, so the same prompt
+stops at the same token in aggregated and disaggregated serving. A request
+that reaches its natural length finishes with `stop`, the way a real answer
+ends on EOS. One that hits `max_new_tokens` first still finishes with
+`length`. `ignore_eos` turns the natural length off for that request, and
+`min_new_tokens` is a floor under it, as in SGLang.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 

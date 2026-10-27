@@ -49,7 +49,7 @@ class Request:
         "rid", "prompt_ids", "max_new_tokens", "prebuilt", "first_token",
         "queue", "blocks", "prefilled", "generated", "cached_tokens",
         "_stream", "_hashes", "finished", "arrival", "cache_salt",
-        "_cache_observed", "observe_cache",
+        "_cache_observed", "observe_cache", "ignore_eos", "min_new_tokens", "stop_after",
     )
 
     def __init__(
@@ -62,6 +62,8 @@ class Request:
         first_token: Optional[int] = None,
         cache_salt: Optional[str] = None,
         observe_cache: bool = True,
+        ignore_eos: bool = False,
+        min_new_tokens: int = 0,
     ) -> None:
         self.rid = rid
         # Prefix-cache namespace: only requests with the same salt share KV.
@@ -81,6 +83,11 @@ class Request:
         self.arrival = time.monotonic()
         self._cache_observed = False
         self.observe_cache = observe_cache
+        self.ignore_eos = ignore_eos
+        self.min_new_tokens = max(int(min_new_tokens), 0)
+        # Generated-token count at which the answer ends on its own; None
+        # means it only ends at max_new_tokens or the context limit.
+        self.stop_after: Optional[int] = None
 
     @property
     def total_tokens(self) -> int:
@@ -151,6 +158,14 @@ class Scheduler:
         if len(request.prompt_ids) > limit:
             raise ValueError(
                 f"Prompt has {len(request.prompt_ids)} tokens; worker capacity is {limit}"
+            )
+        median = self.config.output_len_median
+        if median is not None and not request.ignore_eos and request.stop_after is None:
+            request.stop_after = max(
+                token_gen.natural_length(
+                    request.prompt_ids, median, self.config.output_len_sigma
+                ),
+                request.min_new_tokens,
             )
         self.by_rid[request.rid] = request
         self.waiting.append(request)
@@ -361,6 +376,8 @@ class Scheduler:
 
             if len(request.generated) >= request.max_new_tokens:
                 self._finish(request, FINISH_LENGTH)
+            elif self._reached_natural_end(request):
+                self._finish(request, FINISH_STOP)
             elif request.total_tokens >= self.config.context_len:
                 self._finish(request, FINISH_LENGTH)
 
@@ -449,6 +466,14 @@ class Scheduler:
         request.queue.put_nowait(("token", token))
         if len(request.generated) >= request.max_new_tokens:
             self._finish(request, FINISH_LENGTH)
+        elif self._reached_natural_end(request):
+            self._finish(request, FINISH_STOP)
+
+    @staticmethod
+    def _reached_natural_end(request: Request) -> bool:
+        # Checked after max_new_tokens, as SGLang does: a budget that runs out
+        # on the same token reports "length".
+        return request.stop_after is not None and len(request.generated) >= request.stop_after
 
     def _next_token(self, request: Request) -> int:
         if request._stream is None:                       # noqa: SLF001
@@ -472,6 +497,8 @@ class Scheduler:
             request._stream = None                        # noqa: SLF001
             request.prompt_ids = request.prompt_ids + request.generated
             request.max_new_tokens -= len(request.generated)
+            if request.stop_after is not None:
+                request.stop_after -= len(request.generated)
             request.generated = []
             if request.max_new_tokens <= 0:
                 self._finish(request, FINISH_LENGTH)

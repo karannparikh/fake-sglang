@@ -378,6 +378,8 @@ class Engine:
         prompt_ids = _resolve_prompt_ids(input_ids, prompt, self.sim_config.vocab_size)
         params = dict(sampling_params or {})
         max_new = int(params.get("max_new_tokens") or 128)
+        ignore_eos = bool(params.get("ignore_eos", False))
+        min_new = int(params.get("min_new_tokens") or 0)
         request_id = str(rid or uuid.uuid4().hex)
 
         return self._generate_stream(
@@ -389,6 +391,8 @@ class Engine:
             bootstrap_room=bootstrap_room,
             cache_salt=_single_salt(cache_salt),
             scheduler=self.schedulers[rank],
+            ignore_eos=ignore_eos,
+            min_new_tokens=min_new,
         )
 
     def _resolve_routed_dp_rank(
@@ -450,6 +454,8 @@ class Engine:
         bootstrap_room: Optional[int],
         scheduler: Scheduler,
         cache_salt: Optional[str] = None,
+        ignore_eos: bool = False,
+        min_new_tokens: int = 0,
     ) -> AsyncIterator[dict]:
         mode = self.disaggregation_mode
         started = time.monotonic()
@@ -464,6 +470,8 @@ class Engine:
                 bootstrap_room,
                 started,
                 scheduler,
+                ignore_eos,
+                min_new_tokens,
             )) as stream:
                 async for chunk in stream:
                     yield chunk
@@ -473,6 +481,8 @@ class Engine:
             request_id, prompt_ids, max_new_tokens, cache_salt=cache_salt,
             # Dynamo's disaggregated canaries and warmup use a no-peer transfer.
             observe_cache=bootstrap_host != FAKE_BOOTSTRAP_HOST,
+            ignore_eos=ignore_eos,
+            min_new_tokens=min_new_tokens,
         )
         scheduler.submit(request)
 
@@ -509,6 +519,8 @@ class Engine:
         bootstrap_room: int,
         started: float,
         scheduler: Scheduler,
+        ignore_eos: bool = False,
+        min_new_tokens: int = 0,
     ) -> AsyncIterator[dict]:
         """Wait for the peer's KV, then decode from a prebuilt batch."""
         receiver = KVReceiver(
@@ -536,6 +548,8 @@ class Engine:
             max(max_new_tokens, 1),
             prebuilt=True,
             first_token=handoff,
+            ignore_eos=ignore_eos,
+            min_new_tokens=min_new_tokens,
         )
         scheduler.submit(request)
         try:
