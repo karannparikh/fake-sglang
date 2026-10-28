@@ -107,7 +107,7 @@ class SimConfig:
             server_args.fake_kv_bandwidth_gb_s,
             "fake_kv_bandwidth_gb_s",
         )
-        kv_transfer_overhead_ms = _positive_finite_float(
+        kv_transfer_overhead_ms = _nonnegative_finite_float(
             server_args.fake_kv_transfer_overhead_ms,
             "fake_kv_transfer_overhead_ms",
         )
@@ -138,7 +138,7 @@ class SimConfig:
         if return_overhead is None:
             return_overhead = kv_transfer_overhead_ms
         else:
-            return_overhead = _positive_finite_float(
+            return_overhead = _nonnegative_finite_float(
                 return_overhead,
                 "fake_kv_return_overhead_ms",
             )
@@ -242,4 +242,16 @@ def _positive_finite_float(value: Any, name: str) -> float:
         raise ValueError(f"{name} must be finite and positive") from exc
     if not math.isfinite(number) or number <= 0:
         raise ValueError(f"{name} must be finite and positive")
+    return number
+
+
+def _nonnegative_finite_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite and nonnegative")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite and nonnegative") from exc
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{name} must be finite and nonnegative")
     return number

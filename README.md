@@ -283,10 +283,11 @@ transferred KV on a prebuilt decode request. Each prefill step still pays its
 fixed overhead, and `--fake-speedup-ratio` divides the entire sleep.
 Decode and topology-dependent transfer costs are unchanged.
 
-KV return limits, deadlines, bandwidth, overhead and byte-size overrides must
-be finite and positive; token limits and byte sizes must also be integers.
-Unset reverse-transfer overrides inherit the existing forward-transfer or
-model-derived values.
+KV return limits, deadlines, bandwidth and byte-size overrides must be finite
+and positive; token limits and byte sizes must also be integers. Transfer
+overheads must be finite and nonnegative, so zero remains valid for both
+forward and reverse transfers. Unset reverse-transfer overrides inherit the
+existing forward-transfer or model-derived values.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 

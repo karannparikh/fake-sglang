@@ -80,6 +80,15 @@ def test_kv_return_defaults_fall_back_to_forward_settings(server_args):
     assert config.kv_return_overhead_ms == 2.5
 
 
+def test_disabled_kv_return_preserves_zero_forward_transfer_overhead(server_args):
+    config = SimConfig.from_server_args(server_args(
+        enable_kv_return=False,
+        fake_kv_transfer_overhead_ms=0,
+    ))
+    assert config.kv_transfer_overhead_ms == 0
+    assert config.kv_return_overhead_ms == 0
+
+
 def test_kv_return_cli_overrides_are_independent():
     args = prepare_server_args([
         "--model-path", "stub-model",
@@ -88,7 +97,7 @@ def test_kv_return_cli_overrides_are_independent():
         "--fake-kv-return-deadline-ms", "1234.5",
         "--fake-kv-return-bytes-per-token", "8192",
         "--fake-kv-return-bandwidth-gb-s", "12.5",
-        "--fake-kv-return-overhead-ms", "0.25",
+        "--fake-kv-return-overhead-ms", "0",
     ])
     config = SimConfig.from_server_args(args)
     assert config.enable_kv_return
@@ -96,7 +105,7 @@ def test_kv_return_cli_overrides_are_independent():
     assert config.kv_return_deadline_ms == 1234.5
     assert config.kv_return_bytes_per_token == 8192
     assert config.kv_return_bandwidth_gb_s == 12.5
-    assert config.kv_return_overhead_ms == 0.25
+    assert config.kv_return_overhead_ms == 0
 
 
 @pytest.mark.parametrize("field", [
@@ -112,7 +121,6 @@ def test_invalid_kv_return_integer_settings_fail(server_args, field, value):
 @pytest.mark.parametrize("field", [
     "fake_kv_return_deadline_ms",
     "fake_kv_return_bandwidth_gb_s",
-    "fake_kv_return_overhead_ms",
 ])
 @pytest.mark.parametrize(
     "value",
@@ -123,15 +131,36 @@ def test_invalid_kv_return_float_settings_fail(server_args, field, value):
         SimConfig.from_server_args(server_args(**{field: value}))
 
 
+@pytest.mark.parametrize(
+    "value",
+    [-1, True, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_kv_return_overhead_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_kv_return_overhead_ms"):
+        SimConfig.from_server_args(server_args(
+            fake_kv_return_overhead_ms=value,
+        ))
+
+
 @pytest.mark.parametrize("field", [
     "fake_kv_bandwidth_gb_s",
-    "fake_kv_transfer_overhead_ms",
     "fake_bootstrap_timeout_s",
 ])
 @pytest.mark.parametrize("value", [0, float("nan"), float("inf")])
 def test_invalid_kv_return_fallback_sources_fail(server_args, field, value):
     with pytest.raises(ValueError, match=field):
         SimConfig.from_server_args(server_args(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_forward_transfer_overhead_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_kv_transfer_overhead_ms"):
+        SimConfig.from_server_args(server_args(
+            fake_kv_transfer_overhead_ms=value,
+        ))
 
 
 def test_default_worker_profile_matches_h200_experiment():
