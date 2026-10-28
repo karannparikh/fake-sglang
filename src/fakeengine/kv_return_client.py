@@ -41,6 +41,10 @@ from fakeengine.topology import Link
 logger = logging.getLogger(__name__)
 
 
+class KVReturnLeaseLostError(RuntimeError):
+    """The decode task no longer owns the retained source KV."""
+
+
 class KVReturnControlClient(Protocol):
     timeout_s: float
 
@@ -127,6 +131,8 @@ async def return_generated_kv(
     cache_salt: Optional[str] = None,
     attempt: Optional[KVReturnAttemptContext] = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    task_deadline: Optional[float] = None,
+    owns_source: Optional[Callable[[], bool]] = None,
 ) -> KVReturnOutcome:
     """Prepare, simulate generated-KV transfer, and commit one exact ticket."""
     started_at = time.monotonic()
@@ -143,6 +149,17 @@ async def return_generated_kv(
         client.timeout_s,
         _ticket_budget_s(ticket),
     )
+    if task_deadline is not None:
+        if (
+            isinstance(task_deadline, bool)
+            or not isinstance(task_deadline, (int, float))
+            or not math.isfinite(task_deadline)
+        ):
+            raise KVReturnProtocolError(
+                "KV return task deadline must be a finite monotonic timestamp"
+            )
+        deadline = min(deadline, float(task_deadline))
+    _require_source_ownership(owns_source)
     if deadline <= time.monotonic():
         raise TimeoutError("KV return ticket expired before prepare")
 
@@ -175,6 +192,11 @@ async def return_generated_kv(
         prepared.status == KVReturnControlStatus.COMMITTED
         and prepared.idempotent
     ):
+        try:
+            _require_source_ownership(owns_source)
+        except BaseException:
+            await _best_effort_abort(client, host, port, ticket)
+            raise
         return KVReturnOutcome(
             status=KVReturnOutcomeStatus.COMMITTED,
             attempt_id=ticket.attempt_id,
@@ -200,6 +222,7 @@ async def return_generated_kv(
         )
 
     try:
+        _require_source_ownership(owns_source)
         link = _reverse_link(config, context.prefill_location)
         transfer_ms = TimingModel(config).kv_return_transfer_ms(
             len(generated),
@@ -227,6 +250,7 @@ async def return_generated_kv(
                 ) from exc
         if time.monotonic() >= deadline:
             raise TimeoutError("KV return deadline expired before commit")
+        _require_source_ownership(owns_source)
         commit_started = time.monotonic()
         committed = await client.commit_kv_return(
             host,
@@ -234,6 +258,7 @@ async def return_generated_kv(
             KVReturnCommit(prepare, generated),
             deadline=deadline,
         )
+        _require_source_ownership(owns_source)
     except BaseException:
         await _best_effort_abort(client, host, port, ticket)
         raise
@@ -352,6 +377,15 @@ def validate_kv_return_generated(
             "generated KV payload exceeds the KV return ticket"
         )
     return generated
+
+
+def _require_source_ownership(
+    owns_source: Optional[Callable[[], bool]],
+) -> None:
+    if owns_source is not None and not owns_source():
+        raise KVReturnLeaseLostError(
+            "retained response KV lease ownership was lost"
+        )
 
 
 def _ticket_budget_s(ticket: KVReturnTicket) -> float:
