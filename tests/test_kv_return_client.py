@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock
 
 from aiohttp import web
@@ -234,6 +235,79 @@ async def test_one_client_timeout_covers_simulated_transfer_and_aborts(
     try:
         async with _running_server(scheduler, unused_port) as server:
             metadata = _publish(server, scheduler, 34)
+            with pytest.raises(TimeoutError, match="simulated"):
+                await return_generated_kv(
+                    decode,
+                    client,
+                    host="127.0.0.1",
+                    port=unused_port,
+                    room_metadata=metadata,
+                    generated_token_ids=(5, 6, 7, 8),
+                )
+            assert scheduler.kv_return._attempts == {}
+            assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("clock_offset_s", [-86400, 86400])
+async def test_prefill_wall_clock_skew_does_not_change_ticket_budget(
+    server_args,
+    unused_port,
+    clock_offset_s,
+):
+    scheduler = _scheduler(server_args)
+    decode = _config(server_args, "decode")
+    client = BootstrapClient(0.001, 1)
+    try:
+        async with _running_server(scheduler, unused_port) as server:
+            metadata = _publish(server, scheduler, 44)
+            metadata["ready_ts"] = time.time() + clock_offset_s
+            outcome = await return_generated_kv(
+                decode,
+                client,
+                host="127.0.0.1",
+                port=unused_port,
+                room_metadata=metadata,
+                generated_token_ids=(5, 6, 7, 8),
+                sleep=_no_sleep,
+            )
+    finally:
+        await client.close()
+
+    assert outcome.status == KVReturnOutcomeStatus.COMMITTED
+
+
+class _BudgetPrepareServer(BootstrapServer):
+    async def _prepare_kv_return(self, request):
+        await asyncio.sleep(0.03)
+        return await super()._prepare_kv_return(request)
+
+
+async def test_prepare_and_transfer_share_one_monotonic_budget(
+    server_args,
+    unused_port,
+):
+    scheduler = _scheduler(
+        server_args,
+        fake_kv_return_overhead_ms=30,
+        fake_speedup_ratio=1,
+    )
+    decode = _config(
+        server_args,
+        "decode",
+        fake_kv_return_overhead_ms=30,
+        fake_speedup_ratio=1,
+    )
+    client = BootstrapClient(0.001, 0.05)
+    try:
+        async with _running_server(
+            scheduler,
+            unused_port,
+            _BudgetPrepareServer,
+        ) as server:
+            metadata = _publish(server, scheduler, 45)
+            metadata["ready_ts"] = time.time() + 86400
             with pytest.raises(TimeoutError, match="simulated"):
                 await return_generated_kv(
                     decode,

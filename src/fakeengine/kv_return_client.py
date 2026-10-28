@@ -104,17 +104,17 @@ async def return_generated_kv(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> KVReturnOutcome:
     """Prepare, simulate generated-KV transfer, and commit one exact ticket."""
+    started_at = time.monotonic()
     ticket, generated, prefill_location = _validate_operation(
         config,
         room_metadata,
         generated_token_ids,
     )
-    now = time.monotonic()
-    deadline = now + min(
+    deadline = started_at + min(
         client.timeout_s,
-        _ticket_time_remaining(ticket, room_metadata),
+        _ticket_budget_s(ticket),
     )
-    if deadline <= now:
+    if deadline <= time.monotonic():
         raise TimeoutError("KV return ticket expired before prepare")
 
     prepare = KVReturnPrepare(
@@ -308,26 +308,13 @@ def _validate_operation(
     return ticket, generated, prefill_location
 
 
-def _ticket_time_remaining(
-    ticket: KVReturnTicket,
-    room_metadata: Mapping[str, Any],
-) -> float:
-    ready_ts = room_metadata.get("ready_ts")
-    if (
-        isinstance(ready_ts, bool)
-        or not isinstance(ready_ts, (int, float))
-        or not math.isfinite(ready_ts)
-    ):
+def _ticket_budget_s(ticket: KVReturnTicket) -> float:
+    budget = ticket.deadline_ms / 1000.0
+    if not math.isfinite(budget) or budget <= 0:
         raise KVReturnProtocolError(
-            "room metadata ready_ts must be a finite number"
+            "KV return ticket deadline must be a finite positive duration"
         )
-    elapsed = max(time.time() - float(ready_ts), 0.0)
-    remaining = ticket.deadline_ms / 1000.0 - elapsed
-    if not math.isfinite(remaining):
-        raise KVReturnProtocolError(
-            "KV return ticket deadline produced a non-finite duration"
-        )
-    return remaining
+    return budget
 
 
 def _reverse_link(
