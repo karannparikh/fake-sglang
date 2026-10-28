@@ -35,6 +35,7 @@ from fakeengine.cache_metrics import PrefixCacheMetrics
 from fakeengine.config import SimConfig
 from fakeengine.fpm import ForwardPassPublisher
 from fakeengine.kv_events import NullKvEventEmitter
+from fakeengine.kv_return import KVReturnManager
 from fakeengine.kvcache import BlockPool, block_hashes
 from fakeengine.timing import TimingModel
 
@@ -108,8 +109,11 @@ class Scheduler:
         self, config: SimConfig, kv_events=None,
         fpm: Optional[ForwardPassPublisher] = None,
         cache_metrics: Optional[PrefixCacheMetrics] = None,
+        *,
+        dp_rank: int = 0,
     ) -> None:
         self.config = config
+        self.dp_rank = dp_rank
         self.timing = TimingModel(config)
         # The emitter is wired into the pool itself so an eviction cannot
         # happen without the router hearing about it, whichever code path
@@ -136,6 +140,7 @@ class Scheduler:
         self.prefix_cache_queries = 0
         self.kv_generation_seconds = 0.0
         self._prefix_import_owner = object()
+        self.kv_return = KVReturnManager(self, dp_rank)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -155,6 +160,7 @@ class Scheduler:
                     pass
         finally:
             self._task = None
+            self.kv_return.abort_all()
             for rid in list(self.by_rid):
                 self.abort(rid)
             if self.fpm is not None:
