@@ -18,11 +18,12 @@ occupy blocks. SGLang calls the same thing ``prepare_for_prebuilt`` /
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import math
 import time
 from statistics import pvariance
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.observability.forward_pass_metrics import (
     QueuedRequestMetrics,
@@ -42,6 +43,21 @@ logger = logging.getLogger(__name__)
 FINISH_STOP = "stop"
 FINISH_LENGTH = "length"
 FINISH_ABORT = "abort"
+
+
+@dataclass
+class PrefixImportReservation:
+    prompt_ids: Tuple[int, ...]
+    max_generated_tokens: int
+    cache_salt: Optional[str]
+    _owner: object
+    _prefix_blocks: List[int]
+    _reserved_blocks: List[int]
+    _active: bool = True
+
+    @property
+    def reserved_blocks(self) -> int:
+        return len(self._reserved_blocks)
 
 
 class Request:
@@ -119,6 +135,7 @@ class Scheduler:
         self.prefix_cache_hit_tokens = 0
         self.prefix_cache_queries = 0
         self.kv_generation_seconds = 0.0
+        self._prefix_import_owner = object()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -168,6 +185,122 @@ class Scheduler:
         """Drop cached prefixes. Only unreferenced blocks can go, so this is a
         best-effort hint exactly as it is in a real engine."""
         self.pool.clear_cache()
+
+    # -- local prefix import ----------------------------------------------
+
+    def reserve_prefix_import(
+        self,
+        prompt_ids: Sequence[int],
+        max_generated_tokens: int,
+        cache_salt: Optional[str] = None,
+    ) -> Optional[PrefixImportReservation]:
+        """Hold clean blocks for a future prompt-plus-response prefix."""
+        prompt = tuple(prompt_ids)
+        if (
+            not self.config.prefix_caching
+            or isinstance(max_generated_tokens, bool)
+            or not isinstance(max_generated_tokens, int)
+            or max_generated_tokens < 0
+            or len(prompt) + max_generated_tokens > self.config.context_len
+            or not self._valid_token_ids(prompt)
+            or cache_salt is not None and not isinstance(cache_salt, str)
+        ):
+            return None
+
+        salt = cache_salt or None
+        prompt_hashes = block_hashes(prompt, self.config.block_size, salt)
+        prefix_blocks = self.pool.acquire_prefix(prompt_hashes, touch=False)
+        if len(prefix_blocks) != len(prompt_hashes):
+            self.pool.free(prefix_blocks)
+            return None
+
+        target_blocks = (
+            len(prompt) + max_generated_tokens
+        ) // self.config.block_size
+        reserve_count = target_blocks - len(prompt_hashes)
+        reserved_blocks = self.pool.allocate_clean(reserve_count)
+        if reserved_blocks is None:
+            self.pool.free(prefix_blocks)
+            return None
+
+        return PrefixImportReservation(
+            prompt,
+            max_generated_tokens,
+            salt,
+            self._prefix_import_owner,
+            prefix_blocks,
+            reserved_blocks,
+        )
+
+    def commit_prefix_import(
+        self,
+        reservation: PrefixImportReservation,
+        generated_token_ids: Sequence[int],
+    ) -> bool:
+        """Atomically install all full blocks covered by a reservation."""
+        generated = tuple(generated_token_ids)
+        if (
+            not self._owns_prefix_import(reservation)
+            or len(generated) > reservation.max_generated_tokens
+            or not self._valid_token_ids(generated)
+        ):
+            if self._owns_prefix_import(reservation):
+                self.release_prefix_import(reservation)
+            return False
+
+        token_ids = reservation.prompt_ids + generated
+        hashes = block_hashes(
+            token_ids, self.config.block_size, reservation.cache_salt,
+        )
+        needed = len(hashes) - len(reservation._prefix_blocks)
+        if needed < 0 or needed > len(reservation._reserved_blocks):
+            self.release_prefix_import(reservation)
+            return False
+
+        blocks = (
+            reservation._prefix_blocks
+            + reservation._reserved_blocks[:needed]
+        )
+        added = self.pool.insert_prefix_atomic(hashes, blocks)
+        if added is None:
+            self.release_prefix_import(reservation)
+            return False
+        if added:
+            self.kv_events.publish_stored(
+                token_ids=token_ids,
+                digests=hashes,
+                new_indices=[index for index, _ in added],
+                cache_salt=reservation.cache_salt,
+            )
+        self.release_prefix_import(reservation)
+        return True
+
+    def release_prefix_import(
+        self, reservation: PrefixImportReservation,
+    ) -> bool:
+        if not self._owns_prefix_import(reservation):
+            return False
+        reservation._active = False
+        self.pool.free(
+            reservation._prefix_blocks + reservation._reserved_blocks
+        )
+        return True
+
+    def _owns_prefix_import(
+        self, reservation: PrefixImportReservation,
+    ) -> bool:
+        return (
+            isinstance(reservation, PrefixImportReservation)
+            and reservation._owner is self._prefix_import_owner
+            and reservation._active
+        )
+
+    @staticmethod
+    def _valid_token_ids(token_ids: Sequence[int]) -> bool:
+        return all(
+            isinstance(token, int) and not isinstance(token, bool) and token >= 0
+            for token in token_ids
+        )
 
     # -- stats -------------------------------------------------------------
 
