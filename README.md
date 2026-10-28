@@ -286,7 +286,11 @@ Decode and topology-dependent transfer costs are unchanged.
 KV return limits, deadlines, bandwidth and byte-size overrides must be finite
 and positive; token limits and byte sizes must also be integers. Transfer
 overheads must be finite and nonnegative, so zero remains valid for both
-forward and reverse transfers. Unset reverse-transfer overrides inherit the
+forward and reverse transfers. The bootstrap timeout must be finite and
+nonnegative, so zero stays valid; because the reverse-return deadline falls
+back to `bootstrap timeout x 1000`, enabling KV return on an eligible prefill
+room with a zero bootstrap timeout requires an explicit positive
+`--fake-kv-return-deadline-ms`. Unset reverse-transfer overrides inherit the
 existing forward-transfer or model-derived values.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:

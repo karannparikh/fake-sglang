@@ -111,9 +111,21 @@ class SimConfig:
             server_args.fake_kv_transfer_overhead_ms,
             "fake_kv_transfer_overhead_ms",
         )
-        bootstrap_timeout_s = _positive_finite_float(
+        bootstrap_timeout_s = _nonnegative_finite_float(
             server_args.fake_bootstrap_timeout_s,
             "fake_bootstrap_timeout_s",
+        )
+
+        enable_kv_return = bool(getattr(server_args, "enable_kv_return", False))
+        disaggregation_mode = server_args.disaggregation_mode or "null"
+        prefix_caching = not bool(getattr(server_args, "disable_radix_cache", False))
+        # Mirror ``KVSender._return_ticket``: the reverse path only produces a
+        # ticket on prefill workers with radix caching enabled. Any other
+        # combination omits the capability regardless of timeouts.
+        return_eligible = (
+            enable_kv_return
+            and disaggregation_mode == "prefill"
+            and prefix_caching
         )
 
         return_bytes = getattr(server_args, "fake_kv_return_bytes_per_token", None)
@@ -151,11 +163,23 @@ class SimConfig:
                 return_deadline,
                 "fake_kv_return_deadline_ms",
             )
+        # A zero bootstrap timeout is a legitimate forward-path configuration,
+        # but it collapses the fallback reverse-return deadline to zero. Only
+        # an eligible reverse path actually uses that deadline, so validate the
+        # effective value there rather than forbidding a zero forward timeout.
+        if return_eligible and not (
+            math.isfinite(return_deadline) and return_deadline > 0
+        ):
+            raise ValueError(
+                "enable_kv_return requires a positive reverse-return deadline; "
+                "set fake_kv_return_deadline_ms or a positive "
+                "fake_bootstrap_timeout_s"
+            )
 
         return cls(
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
-            disaggregation_mode=server_args.disaggregation_mode or "null",
+            disaggregation_mode=disaggregation_mode,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
             kv_bytes_per_token=kv_bytes_per_token,
@@ -170,7 +194,7 @@ class SimConfig:
             itl_ms_per_running_req=float(server_args.fake_itl_ms_per_running_req),
             kv_bandwidth_gb_s=kv_bandwidth_gb_s,
             kv_transfer_overhead_ms=kv_transfer_overhead_ms,
-            enable_kv_return=bool(getattr(server_args, "enable_kv_return", False)),
+            enable_kv_return=enable_kv_return,
             kv_return_protocol_version=KV_RETURN_PROTOCOL_VERSION,
             kv_return_max_tokens=_positive_int(
                 getattr(server_args, "fake_kv_return_max_tokens", 4096),
@@ -188,7 +212,7 @@ class SimConfig:
             )
             / 1000.0,
             bootstrap_timeout_s=bootstrap_timeout_s,
-            prefix_caching=not bool(getattr(server_args, "disable_radix_cache", False)),
+            prefix_caching=prefix_caching,
             location=location,
             topology=topology,
         )

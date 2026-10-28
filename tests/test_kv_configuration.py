@@ -142,14 +142,54 @@ def test_invalid_kv_return_overhead_fails(server_args, value):
         ))
 
 
-@pytest.mark.parametrize("field", [
-    "fake_kv_bandwidth_gb_s",
-    "fake_bootstrap_timeout_s",
-])
 @pytest.mark.parametrize("value", [0, float("nan"), float("inf")])
-def test_invalid_kv_return_fallback_sources_fail(server_args, field, value):
-    with pytest.raises(ValueError, match=field):
-        SimConfig.from_server_args(server_args(**{field: value}))
+def test_invalid_kv_bandwidth_fallback_source_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_kv_bandwidth_gb_s"):
+        SimConfig.from_server_args(server_args(fake_kv_bandwidth_gb_s=value))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_bootstrap_timeout_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_bootstrap_timeout_s"):
+        SimConfig.from_server_args(server_args(fake_bootstrap_timeout_s=value))
+
+
+@pytest.mark.parametrize("overrides", [
+    {"enable_kv_return": False},
+    {"enable_kv_return": False, "disaggregation_mode": "null"},
+    {"enable_kv_return": False, "disable_radix_cache": True},
+    {"enable_kv_return": True, "disable_radix_cache": True},
+])
+def test_zero_bootstrap_timeout_accepted_when_return_ineligible(server_args, overrides):
+    config = SimConfig.from_server_args(server_args(
+        fake_bootstrap_timeout_s=0, **overrides,
+    ))
+    assert config.bootstrap_timeout_s == 0
+    assert config.kv_return_deadline_ms == 0
+
+
+def test_zero_bootstrap_timeout_with_positive_return_override_enables_return(server_args):
+    config = SimConfig.from_server_args(server_args(
+        enable_kv_return=True,
+        disaggregation_mode="prefill",
+        fake_bootstrap_timeout_s=0,
+        fake_kv_return_deadline_ms=1234.5,
+    ))
+    assert config.enable_kv_return
+    assert config.bootstrap_timeout_s == 0
+    assert config.kv_return_deadline_ms == 1234.5
+
+
+def test_enabled_return_with_zero_effective_deadline_fails(server_args):
+    with pytest.raises(ValueError, match="positive reverse-return deadline"):
+        SimConfig.from_server_args(server_args(
+            enable_kv_return=True,
+            disaggregation_mode="prefill",
+            fake_bootstrap_timeout_s=0,
+        ))
 
 
 @pytest.mark.parametrize(
