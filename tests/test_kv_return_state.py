@@ -229,6 +229,24 @@ def test_commit_revalidates_tokens_checksum_and_controls(
     assert events.stored == events.removed == []
 
 
+def test_commit_rejects_payload_shorter_than_prepared(server_args):
+    scheduler, events = _scheduler(server_args)
+    _seed(scheduler)
+    ticket = _ticket(scheduler)
+    actual = (5, 6)
+    prepare = replace(
+        _prepare(ticket),
+        token_ids_checksum=kv_return_checksum(ticket, actual),
+    )
+    assert scheduler.kv_return.prepare(prepare).status == KVReturnStatus.PREPARED
+
+    result = scheduler.kv_return.commit(KVReturnCommit(prepare, actual))
+
+    assert result.status == KVReturnStatus.INCOMPATIBLE
+    assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+    assert events.stored == events.removed == []
+
+
 def test_commit_before_prepare_and_unissued_nonce_are_typed(server_args):
     scheduler, events = _scheduler(server_args)
     _seed(scheduler)
@@ -242,6 +260,27 @@ def test_commit_before_prepare_and_unissued_nonce_are_typed(server_args):
     assert scheduler.kv_return.prepare(_prepare(unissued)).status == (
         KVReturnStatus.NOT_FOUND
     )
+    assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+    assert events.stored == events.removed == []
+
+
+def test_issued_only_expiry_is_stable_for_all_authenticated_calls(server_args):
+    now = [10.0]
+    scheduler, events = _scheduler(server_args, clock=lambda: now[0])
+    _seed(scheduler)
+    ticket = _ticket(scheduler)
+    prepare = _prepare(ticket)
+    now[0] += ticket.deadline_ms / 1000
+    assert scheduler.kv_return.expire() == 1
+
+    commit = scheduler.kv_return.commit(KVReturnCommit(prepare, (5, 6, 7, 8)))
+    retry_prepare = scheduler.kv_return.prepare(prepare)
+    abort = scheduler.kv_return.abort(_abort(ticket))
+
+    assert commit.status == retry_prepare.status == abort.status == (
+        KVReturnStatus.EXPIRED
+    )
+    assert commit.idempotent and retry_prepare.idempotent and abort.idempotent
     assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
     assert events.stored == events.removed == []
 

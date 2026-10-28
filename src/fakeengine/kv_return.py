@@ -291,6 +291,19 @@ class KVReturnManager:
                 KVReturnStatus.INCOMPATIBLE,
                 commit=commit,
             )
+        actual_token_count = len(commit.generated_token_ids)
+        actual_payload_bytes = (
+            actual_token_count * self.compatibility.kv_bytes_per_token
+        )
+        if (
+            actual_token_count != prepare.generated_token_count
+            or actual_payload_bytes != prepare.claimed_payload_bytes
+        ):
+            return self._finish(
+                attempt,
+                KVReturnStatus.INCOMPATIBLE,
+                commit=commit,
+            )
         if not self._valid_tokens(commit.generated_token_ids):
             return self._finish(
                 attempt,
@@ -423,22 +436,31 @@ class KVReturnManager:
         commit: Optional[KVReturnCommit] = None,
         abort: Optional[KVReturnAbort] = None,
     ) -> KVReturnResult:
+        ticket_matches = (
+            prepare is not None
+            and prepare.ticket == terminal.ticket
+            and prepare.attempt_id == terminal.ticket.attempt_id
+        )
         if commit is not None:
+            if terminal.commit_key is not None:
+                compatible = _fingerprint(commit) == terminal.commit_key
+            elif terminal.prepare_key is not None:
+                compatible = _fingerprint(prepare) == terminal.prepare_key
+            else:
+                compatible = ticket_matches
+        elif prepare is not None:
             compatible = (
-                _fingerprint(commit) == terminal.commit_key
-                if terminal.commit_key is not None
-                else _fingerprint(prepare) == terminal.prepare_key
+                _fingerprint(prepare) == terminal.prepare_key
+                if terminal.prepare_key is not None
+                else ticket_matches
             )
-        elif prepare is not None and terminal.prepare_key is not None:
-            compatible = _fingerprint(prepare) == terminal.prepare_key
         elif abort is not None:
             compatible = (
                 abort.ticket == terminal.ticket
                 and abort.attempt_id == terminal.ticket.attempt_id
             )
         else:
-            operation_ticket = prepare.ticket if prepare is not None else None
-            compatible = operation_ticket == terminal.ticket
+            compatible = False
         if compatible:
             return KVReturnResult(terminal.status, idempotent=True)
         return KVReturnResult(
