@@ -25,7 +25,7 @@ import math
 import time
 import uuid
 from statistics import pvariance
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.observability.forward_pass_metrics import (
     QueuedRequestMetrics,
@@ -234,6 +234,7 @@ class Scheduler:
         cache_metrics: Optional[PrefixCacheMetrics] = None,
         *,
         dp_rank: int = 0,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.config = config
         self.dp_rank = dp_rank
@@ -272,6 +273,7 @@ class Scheduler:
         self._retained_blocks = 0
         self._retained_bytes = 0
         self._retention_rejections = 0
+        self._clock = clock or time.monotonic
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -375,7 +377,7 @@ class Scheduler:
 
         lease._state.released = True                        # noqa: SLF001
         lease._state.released_at = (                        # noqa: SLF001
-            time.monotonic() if now is None else now
+            self._clock() if now is None else now
         )
         lease._state.release_reason = reason                 # noqa: SLF001
         self._retention_leases.pop(lease.lease_id, None)
@@ -387,7 +389,7 @@ class Scheduler:
         return True
 
     def expire_retention_leases(self, now: Optional[float] = None) -> int:
-        current = time.monotonic() if now is None else now
+        current = self._clock() if now is None else now
         expired = [
             lease
             for lease in self._retention_leases.values()
@@ -406,6 +408,7 @@ class Scheduler:
         cache_salt: Optional[str] = None,
     ) -> Optional[PrefixImportReservation]:
         """Hold clean blocks for a future prompt-plus-response prefix."""
+        self.expire_retention_leases()
         prompt = tuple(prompt_ids)
         if (
             not self.config.prefix_caching
@@ -623,7 +626,7 @@ class Scheduler:
             next_deadline = min(
                 lease.deadline for lease in self._retention_leases.values()
             )
-            timeouts.append(max(next_deadline - time.monotonic(), 0.0))
+            timeouts.append(max(next_deadline - self._clock(), 0.0))
         return min(timeouts) if timeouts else None
 
     async def _prefill_step(self) -> bool:
@@ -768,6 +771,7 @@ class Scheduler:
     ) -> None:
         self.last_step_ms = milliseconds
         await self.timing.sleep_ms(milliseconds)
+        self.expire_retention_leases()
         if self.fpm is not None:
             self.fpm.publish(
                 scheduled, self._queued_metrics(scheduled_ids),
@@ -785,6 +789,7 @@ class Scheduler:
 
     def _reserve_prefix(self, request: Request) -> bool:
         """Take the cached prefix, then confirm the rest is affordable."""
+        self.expire_retention_leases()
         if request.prebuilt:
             # KV arrived over the transfer, so from this worker's point of view
             # the whole prompt is already "cached" -- it is never recomputed.
@@ -807,6 +812,7 @@ class Scheduler:
         return request.cached_tokens == len(request.prompt_ids) or self.pool.can_allocate(1)
 
     def _grow_blocks(self, request: Request, token_capacity: int) -> bool:
+        self.expire_retention_leases()
         needed = math.ceil(token_capacity / self.config.block_size)
         deficit = needed - len(request.blocks)
         if deficit <= 0:
@@ -913,6 +919,7 @@ class Scheduler:
     def _retention_shape(
         self, request: Request, generated_token_count: int,
     ) -> Tuple[Optional[str], int, int, int, int]:
+        self.expire_retention_leases()
         block_size = self.config.block_size
         start = request._original_prompt_token_count // block_size  # noqa: SLF001
         stop = math.ceil(
@@ -972,7 +979,7 @@ class Scheduler:
             self._retention_rejections += 1
             return None
 
-        created_at = time.monotonic()
+        created_at = self._clock()
         lease = KVRetentionLease(
             lease_id=uuid.uuid4().hex,
             request_id=request.rid,
