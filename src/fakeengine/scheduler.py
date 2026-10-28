@@ -52,6 +52,7 @@ _KV_RETURN_REJECTION_REASONS = frozenset({
     "invalid_payload",
     "task_limit",
     "task_creation",
+    "lease_unavailable",
     "shutdown",
     "retention_capacity",
     "retention_lease_budget",
@@ -81,6 +82,7 @@ _KV_RETURN_FAILURE_REASONS = frozenset({
     "deadline_timeout",
     "transport",
     "protocol",
+    "lease_lost",
     "cancelled",
     "unexpected",
 })
@@ -106,6 +108,9 @@ class _KVRetentionState:
     released: bool = False
     released_at: Optional[float] = None
     release_reason: Optional[str] = None
+    claim_token: Optional[object] = None
+    claimed_at: Optional[float] = None
+    claim_deadline: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +144,23 @@ class KVRetentionLease:
     @property
     def release_reason(self) -> Optional[str]:
         return self._state.release_reason
+
+    @property
+    def claimed(self) -> bool:
+        return self._state.claim_token is not None and not self.released
+
+    @property
+    def claim_deadline(self) -> Optional[float]:
+        return self._state.claim_deadline
+
+
+@dataclass(frozen=True)
+class KVRetentionClaim:
+    lease: KVRetentionLease
+    claimed_at: float
+    deadline: float
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
 
 
 class Request:
@@ -408,6 +430,7 @@ class Scheduler:
         self,
         lease: KVRetentionLease,
         *,
+        claim: Optional[KVRetentionClaim] = None,
         reason: str = "released",
         now: Optional[float] = None,
     ) -> bool:
@@ -415,6 +438,17 @@ class Scheduler:
             not isinstance(lease, KVRetentionLease)
             or lease._owner is not self._retention_owner
         ):
+            return False
+        claim_token = lease._state.claim_token                   # noqa: SLF001
+        if claim_token is not None:
+            if (
+                not isinstance(claim, KVRetentionClaim)
+                or claim._owner is not self._retention_owner
+                or claim.lease is not lease
+                or claim._token is not claim_token
+            ):
+                return False
+        elif claim is not None:
             return False
         if lease.released:
             return True
@@ -437,12 +471,60 @@ class Scheduler:
         self._publish_kv_return_state()
         return True
 
+    def claim_retention(
+        self,
+        lease: KVRetentionLease,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[KVRetentionClaim]:
+        if (
+            not isinstance(lease, KVRetentionLease)
+            or lease._owner is not self._retention_owner
+        ):
+            return None
+        current = self._clock() if now is None else now
+        if (
+            lease.released
+            or lease._state.claim_token is not None              # noqa: SLF001
+            or self._retention_leases.get(lease.lease_id) is not lease
+        ):
+            return None
+        if lease.deadline <= current:
+            self.release_retention(lease, reason="expired", now=current)
+            return None
+
+        token = object()
+        deadline = (
+            current
+            + self.config.kv_return_retention_timeout_ms / 1000.0
+        )
+        lease._state.claim_token = token                          # noqa: SLF001
+        lease._state.claimed_at = current                         # noqa: SLF001
+        lease._state.claim_deadline = deadline                    # noqa: SLF001
+        return KVRetentionClaim(
+            lease,
+            current,
+            deadline,
+            self._retention_owner,
+            token,
+        )
+
+    def owns_retention_claim(self, claim: KVRetentionClaim) -> bool:
+        return (
+            isinstance(claim, KVRetentionClaim)
+            and claim._owner is self._retention_owner
+            and self._retention_leases.get(claim.lease.lease_id)
+            is claim.lease
+            and not claim.lease.released
+            and claim.lease._state.claim_token is claim._token   # noqa: SLF001
+        )
+
     def expire_retention_leases(self, now: Optional[float] = None) -> int:
         current = self._clock() if now is None else now
         expired = [
             lease
             for lease in self._retention_leases.values()
-            if lease.deadline <= current
+            if not lease.claimed and lease.deadline <= current
         ]
         for lease in sorted(expired, key=lambda item: (item.deadline, item.lease_id)):
             self.release_retention(lease, reason="expired", now=current)
@@ -740,9 +822,13 @@ class Scheduler:
         timeouts: List[float] = []
         if self.fpm is not None:
             timeouts.append(1.0)
-        if self._retention_leases:
+        idle_leases = [
+            lease for lease in self._retention_leases.values()
+            if not lease.claimed
+        ]
+        if idle_leases:
             next_deadline = min(
-                lease.deadline for lease in self._retention_leases.values()
+                lease.deadline for lease in idle_leases
             )
             timeouts.append(max(next_deadline - self._clock(), 0.0))
         return min(timeouts) if timeouts else None

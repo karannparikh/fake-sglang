@@ -43,13 +43,19 @@ from fakeengine.fpm import ForwardPassPublisher
 from fakeengine.kv_events import build_emitter
 from fakeengine.kv_return_client import (
     KVReturnAttemptContext,
+    KVReturnLeaseLostError,
     KVReturnOutcome,
     KVReturnOutcomeStatus,
     return_generated_kv,
     validate_kv_return_attempt,
     validate_kv_return_generated,
 )
-from fakeengine.scheduler import KVRetentionLease, Request, Scheduler
+from fakeengine.scheduler import (
+    KVRetentionClaim,
+    KVRetentionLease,
+    Request,
+    Scheduler,
+)
 from fakeengine.stats import MetricsPusher
 from fakeengine.transfer import KVReceiver, KVSender
 
@@ -59,12 +65,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _BackgroundKVReturn:
     scheduler: Scheduler
-    lease: KVRetentionLease
+    claim: KVRetentionClaim
     attempt: KVReturnAttemptContext
     host: str
     port: int
     start: asyncio.Event
     finished: bool = False
+
+    @property
+    def lease(self) -> KVRetentionLease:
+        return self.claim.lease
 
 
 class _SchedulerInitResult:
@@ -713,9 +723,13 @@ class Engine:
             scheduler.release_retention(lease, reason="task_limit")
             return None
 
+        claim = scheduler.claim_retention(lease)
+        if claim is None:
+            scheduler.record_kv_return_rejected("lease_unavailable")
+            return None
         state = _BackgroundKVReturn(
             scheduler,
-            lease,
+            claim,
             attempt,
             host,
             port,
@@ -727,7 +741,11 @@ class Engine:
         except Exception:
             coroutine.close()
             scheduler.record_kv_return_rejected("task_creation")
-            scheduler.release_retention(lease, reason="task_creation")
+            scheduler.release_retention(
+                lease,
+                claim=claim,
+                reason="task_creation",
+            )
             return None
         self._kv_return_tasks[task] = state
         scheduler.record_kv_return_attempt()
@@ -742,7 +760,20 @@ class Engine:
         release_reason = "failed"
         assert self._bootstrap_client is not None
         try:
-            await state.start.wait()
+            remaining = state.claim.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "KV return task deadline expired before start"
+                )
+            try:
+                await asyncio.wait_for(
+                    state.start.wait(),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "KV return task deadline expired before start"
+                ) from exc
             outcome = await return_generated_kv(
                 self.sim_config,
                 self._bootstrap_client,
@@ -752,7 +783,15 @@ class Engine:
                 generated_token_ids=state.lease.generated_token_ids,
                 attempt=state.attempt,
                 sleep=self._kv_return_sleep,
+                task_deadline=state.claim.deadline,
+                owns_source=lambda: scheduler.owns_retention_claim(
+                    state.claim
+                ),
             )
+            if not scheduler.owns_retention_claim(state.claim):
+                raise KVReturnLeaseLostError(
+                    "retained response KV lease ownership was lost"
+                )
             release_reason = outcome.status.value
             self._record_kv_return_outcome(scheduler, outcome)
         except asyncio.CancelledError:
@@ -773,6 +812,12 @@ class Engine:
             logger.warning(
                 "fake-sglang: response KV return transport failed"
             )
+        except KVReturnLeaseLostError:
+            scheduler.record_kv_return_failed("lease_lost")
+            release_reason = "lease_lost"
+            logger.warning(
+                "fake-sglang: response KV return lease ownership lost"
+            )
         except KVReturnProtocolError:
             scheduler.record_kv_return_failed("protocol")
             release_reason = "protocol"
@@ -789,6 +834,7 @@ class Engine:
         finally:
             scheduler.release_retention(
                 state.lease,
+                claim=state.claim,
                 reason=release_reason,
             )
             scheduler.record_kv_return_task_finished()
@@ -841,6 +887,7 @@ class Engine:
             state.scheduler.record_kv_return_failed("cancelled")
             state.scheduler.release_retention(
                 state.lease,
+                claim=state.claim,
                 reason="cancelled",
             )
             state.scheduler.record_kv_return_task_finished()
@@ -860,6 +907,7 @@ class Engine:
                 state.scheduler.record_kv_return_failed("cancelled")
                 state.scheduler.release_retention(
                     state.lease,
+                    claim=state.claim,
                     reason="cancelled",
                 )
                 state.scheduler.record_kv_return_task_finished()

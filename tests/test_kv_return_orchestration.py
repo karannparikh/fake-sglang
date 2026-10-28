@@ -224,6 +224,18 @@ async def test_terminal_response_precedes_delayed_return_and_race_may_miss(
         await asyncio.wait_for(entered.wait(), 1)
         assert decode.scheduler.stats()["kv_return_active_tasks"] == 1
         assert decode.scheduler.stats()["kv_retention_blocks"] > 0
+        [state] = decode._kv_return_tasks.values()
+        assert time.monotonic() < state.claim.deadline
+        assert decode.scheduler.expire_retention_leases(
+            now=state.lease.deadline,
+        ) == 0
+        decode.scheduler.abort_all()
+        assert decode.scheduler.owns_retention_claim(state.claim)
+        assert not state.lease.released
+        assert decode.scheduler.stats()["kv_return_active_tasks"] == 1
+        assert decode.scheduler.stats()["kv_retention_blocks"] == (
+            state.lease.block_count
+        )
 
         immediate_stream = await prefill.async_generate(
             input_ids=PROMPT + response,
@@ -234,6 +246,8 @@ async def test_terminal_response_precedes_delayed_return_and_race_may_miss(
 
         release.set()
         await _wait_for_returns(decode)
+        assert decode.scheduler.stats()["kv_return_stored"] == 1
+        assert decode.scheduler.active_retention_leases == ()
         eventual_stream = await prefill.async_generate(
             input_ids=PROMPT + response,
             sampling_params={"max_new_tokens": 1},
@@ -244,6 +258,63 @@ async def test_terminal_response_precedes_delayed_return_and_race_may_miss(
         )
     finally:
         release.set()
+        await decode._async_shutdown()
+        await prefill._async_shutdown()
+
+
+async def test_retention_task_deadline_aborts_before_slow_transfer_commit(
+    server_args,
+    unused_port,
+):
+    settings = {
+        "fake_kv_return_retention_timeout_ms": 50,
+        "fake_kv_return_overhead_ms": 200,
+        "fake_speedup_ratio": 1,
+    }
+    prefill = Engine(server_args=server_args(
+        **_args(unused_port, "prefill", **settings),
+    ))
+    decode = Engine(server_args=server_args(
+        **_args(unused_port, "decode", **settings),
+    ))
+    events = RecordingEvents()
+    commit_calls = 0
+    original_commit = prefill.scheduler.kv_return.commit
+
+    def record_commit(commit):
+        nonlocal commit_calls
+        commit_calls += 1
+        return original_commit(commit)
+
+    prefill.scheduler.kv_return.commit = record_commit
+    try:
+        await _prefill(prefill, unused_port, 3012)
+        prefill.scheduler.kv_events = events
+        response, chunks = await _decode(decode, unused_port, 3012)
+
+        assert chunks[-1]["meta_info"]["kv_return"]["status"] == "scheduled"
+        await _wait_for_returns(decode)
+
+        stats = decode.scheduler.stats()
+        assert commit_calls == 0
+        assert events.stored == []
+        assert prefill.scheduler.pool.match_prefix(
+            block_hashes(PROMPT + response, 4)
+        ) == 2
+        assert prefill.scheduler.kv_return._attempts == {}
+        assert prefill.scheduler.stats()["kv_used_blocks"] == 2
+        assert stats["kv_return_stored"] == 0
+        assert stats["kv_return_tokens"] == 0
+        assert stats["kv_return_failed_by_reason"] == {
+            "transfer_timeout": 1,
+        }
+        assert stats["kv_return_active_tasks"] == 0
+        assert stats["kv_retention_active_leases"] == 0
+        assert stats["kv_retention_blocks"] == 0
+        assert decode.scheduler.pool.can_allocate(
+            decode.scheduler.pool.num_blocks
+        )
+    finally:
         await decode._async_shutdown()
         await prefill._async_shutdown()
 

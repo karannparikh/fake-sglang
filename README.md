@@ -323,11 +323,15 @@ outside that exact slice is freed at ordinary request completion.
 
 Leases remain visible in ordinary scheduler KV occupancy plus
 `kv_retention_*` scheduler stats until idempotent explicit release, deterministic
-timeout expiry, abort-all, or scheduler shutdown. Count, block, and byte
-budgets decline only the optimization; the completed model response still
-succeeds. Aborted, failed, or disconnected-before-terminal requests never
-schedule returns. Retained prebuilt decode blocks are not inserted into the
-decode cache and do not publish local KV store events.
+timeout expiry, abort-all, or scheduler shutdown. Scheduling atomically claims
+the lease: generic idle expiry and abort controls cannot free a claimed lease,
+and only its background task can release it. The claim receives a fresh
+`--fake-kv-return-retention-timeout-ms` task deadline, which bounds terminal
+handoff plus prepare/transfer/commit. Count, block, and byte budgets decline
+only the optimization; the completed model response still succeeds. Aborted,
+failed, or disconnected-before-terminal requests never schedule returns.
+Retained prebuilt decode blocks are not inserted into the decode cache and do
+not publish local KV store events.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
