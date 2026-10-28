@@ -111,13 +111,14 @@ class BootstrapServer:
         kv_bytes: int,
         first_token: Optional[int] = None,
         location: Optional[str] = None,
+        kv_return: Optional[Dict[str, Any]] = None,
     ) -> None:
         # ``first_token`` is prefill's real output. SGLang hands the same value
         # to decode through its metadata buffer rather than the KV payload
         # (``disaggregation/decode.py::_commit_transfer_to_req``); carrying it
         # here is what makes a disaggregated answer identical to an aggregated
         # one for the same prompt.
-        self._rooms[int(room)] = {
+        metadata: Dict[str, Any] = {
             "bootstrap_room": int(room),
             "num_tokens": int(num_tokens),
             "kv_bytes": int(kv_bytes),
@@ -125,6 +126,9 @@ class BootstrapServer:
             "location": location,
             "ready_ts": time.time(),
         }
+        if kv_return is not None:
+            metadata["kv_return"] = kv_return
+        self._rooms[int(room)] = metadata
 
     def fail_room(self, room: int, reason: str) -> None:
         self._rooms[int(room)] = {

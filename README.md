@@ -256,6 +256,12 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-itl-ms-per-running-req` | 0.35 | ITL added per extra request in the batch |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
+| `--enable-kv-return` | false | Advertise version-1 reverse-KV return capability on eligible prefill rooms |
+| `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return ticket accepts |
+| `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Return-ticket deadline in milliseconds |
+| `--fake-kv-return-bytes-per-token` | model-derived forward value | Reverse-transfer payload bytes per generated token |
+| `--fake-kv-return-bandwidth-gb-s` | forward KV bandwidth | Reverse-transfer bandwidth override |
+| `--fake-kv-return-overhead-ms` | forward transfer overhead | Fixed reverse-transfer overhead override |
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
@@ -277,6 +283,16 @@ transferred KV on a prebuilt decode request. Each prefill step still pays its
 fixed overhead, and `--fake-speedup-ratio` divides the entire sleep.
 Decode and topology-dependent transfer costs are unchanged.
 
+KV return limits, deadlines, bandwidth and byte-size overrides must be finite
+and positive; token limits and byte sizes must also be integers. Transfer
+overheads must be finite and nonnegative, so zero remains valid for both
+forward and reverse transfers. The bootstrap timeout must be finite and
+nonnegative, so zero stays valid; because the reverse-return deadline falls
+back to `bootstrap timeout x 1000`, enabling KV return on an eligible prefill
+room with a zero bootstrap timeout requires an explicit positive
+`--fake-kv-return-deadline-ms`. Unset reverse-transfer overrides inherit the
+existing forward-transfer or model-derived values.
+
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
 ```bash
@@ -297,7 +313,9 @@ KV handoff.
 frontend --> PrefillRouter --> prefill worker   (max_tokens forced to 1)
                                     |
                     yields disaggregated_params {bootstrap_host, port, room}
-                    and publishes the room on its bootstrap HTTP server
+                    and publishes the room on its bootstrap HTTP server;
+                    eligible rooms also advertise a nonce-bound kv_return
+                    capability for the exact prefill DP rank
                                     |
              PrefillRouter stamps it onto the decode leg as bootstrap_info
                                     v
@@ -311,7 +329,16 @@ frontend --> PrefillRouter --> prefill worker   (max_tokens forced to 1)
 
 `bootstrap_host == "2.2.2.2"` (SGLang's `FAKE_BOOTSTRAP_HOST`) short-circuits
 the whole handshake. Dynamo's health-check canary and prefill warmup both use
-it; without that path, warmup would block for its 1800 s timeout.
+it; without that path, warmup would block for its 1800 s timeout. Sentinel
+requests never publish `kv_return` metadata.
+
+`--enable-kv-return` is disabled by default. On a real disaggregated prefill
+room with radix caching enabled, it adds a version-1 `kv_return` object with an
+unguessable per-room nonce, the prefill DP rank, the maximum return-token count
+and the deadline. No session ID is used. This first stack layer only negotiates
+that capability: decode does not retain generated KV, transfer it back, import
+it into the prefill scheduler, call prepare/commit endpoints, or start any
+background return task yet.
 
 ## KV-aware routing
 

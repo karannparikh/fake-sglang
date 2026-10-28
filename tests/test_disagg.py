@@ -51,6 +51,19 @@ async def _prefill_then_decode(prefill, decode, room, *, max_new_tokens):
     return prefill_tokens, decode_tokens, decode_meta
 
 
+async def _publish_prefill_room(prefill, room, *, host="127.0.0.1"):
+    stream = await prefill.async_generate(
+        input_ids=PROMPT,
+        sampling_params={"max_new_tokens": 1},
+        stream=True,
+        bootstrap_host=host,
+        bootstrap_port=prefill.sim_config.bootstrap_port,
+        bootstrap_room=room,
+    )
+    await _collect(stream)
+    return prefill._bootstrap_server._rooms.get(room)
+
+
 @pytest.fixture
 async def pd_pair(server_args):
     prefill = Engine(
@@ -102,6 +115,97 @@ async def test_room_is_released_once_the_transfer_lands(pd_pair):
     prefill, decode = pd_pair
     await _prefill_then_decode(prefill, decode, 1004, max_new_tokens=2)
     assert prefill._bootstrap_server._rooms == {}
+
+
+@pytest.mark.parametrize("overrides", [
+    {},
+    {"enable_kv_return": True, "disable_radix_cache": True},
+])
+async def test_kv_return_metadata_is_omitted_when_ineligible(
+    server_args,
+    unused_port,
+    overrides,
+):
+    prefill = Engine(server_args=server_args(
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=unused_port,
+        **overrides,
+    ))
+    try:
+        metadata = await _publish_prefill_room(prefill, 1100)
+        assert metadata is not None
+        assert set(metadata) == {
+            "bootstrap_room",
+            "num_tokens",
+            "kv_bytes",
+            "first_token",
+            "location",
+            "ready_ts",
+        }
+        assert "kv_return" not in metadata
+    finally:
+        await prefill._async_shutdown()
+
+
+async def test_enabled_prefill_rooms_advertise_unique_return_tickets(
+    server_args,
+    unused_port,
+):
+    prefill = Engine(server_args=server_args(
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=unused_port,
+        enable_kv_return=True,
+        fake_kv_return_max_tokens=257,
+        fake_kv_return_deadline_ms=1234.5,
+    ))
+    try:
+        first = await _publish_prefill_room(prefill, 1101)
+        second = await _publish_prefill_room(prefill, 1102)
+        first_ticket = first["kv_return"]
+        second_ticket = second["kv_return"]
+        assert set(first_ticket) == {
+            "version",
+            "enabled",
+            "nonce",
+            "prefill_dp_rank",
+            "max_return_tokens",
+            "deadline_ms",
+        }
+        assert first_ticket == {
+            "version": 1,
+            "enabled": True,
+            "nonce": first_ticket["nonce"],
+            "prefill_dp_rank": 0,
+            "max_return_tokens": 257,
+            "deadline_ms": 1234.5,
+        }
+        assert len(first_ticket["nonce"]) >= 32
+        assert first_ticket["nonce"] != second_ticket["nonce"]
+        assert "session_id" not in first_ticket
+        assert "session_id" not in second_ticket
+    finally:
+        await prefill._async_shutdown()
+
+
+async def test_fake_prefill_bootstrap_host_never_publishes_return_metadata(
+    server_args,
+    unused_port,
+):
+    prefill = Engine(server_args=server_args(
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=unused_port,
+        enable_kv_return=True,
+    ))
+    try:
+        metadata = await _publish_prefill_room(
+            prefill,
+            1103,
+            host=FAKE_BOOTSTRAP_HOST,
+        )
+        assert metadata is None
+        assert prefill._bootstrap_server._rooms == {}
+    finally:
+        await prefill._async_shutdown()
 
 
 async def test_transfer_time_tracks_bandwidth(pd_pair, server_args):
