@@ -33,6 +33,9 @@ SGLang and never knows the difference.
   the prefill and decode workers, with the payload cost simulated as
   `tokens x kv_bytes_per_token / bandwidth`. `kv_bytes_per_token` is derived
   from the model's real `config.json`.
+- **Response-KV return** — an optional, best-effort background
+  prepare/transfer/commit from decode back to the original prefill DP rank,
+  retaining only the completed response tail while the attempt is active.
 - **KV events** — block stores and evictions published over ZMQ in SGLang's
   exact wire format, so Dynamo's KV-aware router builds a real prefix tree and
   routes on cache hits.
@@ -68,6 +71,12 @@ Scheduler metrics also report the cumulative observed token hit rate.
 uncached-prefill K/V-generation time after speedup scaling, excluding no-peer
 warmups. Recomputed tokens after preemption incur generation time again,
 without counting another cache observation.
+
+Enabled response return adds bounded `sglang:simulated_kv_return_` metrics for
+accepted attempts, stored responses, rejected and failed attempts by stable
+reason, returned tokens/bytes, transfer and commit time, active tasks, and
+retained blocks. The scheduler's KV occupancy and retention lease counters
+remain the source of truth; these metrics only report orchestration outcomes.
 
 `--enable-forward-pass-metrics` requires Dynamo's injected
 `--forward-pass-metrics-ipc-name` and `--forward-pass-metrics-worker-id`.
@@ -261,7 +270,7 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-itl-ms-per-running-req` | 0.35 | ITL added per extra request in the batch |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
-| `--enable-kv-return` | false | Advertise version-1 reverse-KV return capability on eligible prefill rooms |
+| `--enable-kv-return` | false | Enable version-1 best-effort response-KV return on eligible prefill and decode workers |
 | `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return ticket accepts |
 | `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Return-ticket deadline in milliseconds |
 | `--fake-kv-return-bytes-per-token` | model-derived forward value | Reverse-transfer payload bytes per generated token |
@@ -302,23 +311,23 @@ room with a zero bootstrap timeout requires an explicit positive
 `--fake-kv-return-deadline-ms`. Unset reverse-transfer overrides inherit the
 existing forward-transfer or model-derived values.
 
-Completed decode KV retention is also opt-in per prebuilt request and is off by
-default. On successful completion, the scheduler can expose a typed lease that
-keeps the request's existing response-overlapping blocks referenced. For block
-size `B`, prompt length `P`, and generated length `G`, the lease owns block
-indices `floor(P/B)` through `ceil((P+G)/B)-1`; an unaligned prompt therefore
-retains the shared prompt/response boundary block. The lease carries the
-request ID, prompt and generated token counts, generated token IDs for later
-commit orchestration, exact block IDs and retained bytes, `cache_salt`, and
-creation/deadline/release state. Raw token IDs are not logged.
+Eligible normal decode completion now uses the existing typed retention lease
+automatically. Eligibility requires decode mode, local `--enable-kv-return`,
+radix caching, a real peer, and a valid server-issued room ticket whose
+compatibility, prefill rank, room, and `cache_salt` match the decode request.
+No ticket is inferred from a request or session ID. For block size `B`, prompt
+length `P`, and generated length `G`, the lease owns block indices
+`floor(P/B)` through `ceil((P+G)/B)-1`; an unaligned prompt therefore retains
+the shared prompt/response boundary block. The original transferred prompt KV
+outside that exact slice is freed at ordinary request completion.
 
 Leases remain visible in ordinary scheduler KV occupancy plus
 `kv_retention_*` scheduler stats until idempotent explicit release, deterministic
 timeout expiry, abort-all, or scheduler shutdown. Count, block, and byte
-budgets decline only the retention optimization; the completed model response
-still succeeds and its `done` delivery does not wait for release. Aborted or
-failed requests never create leases. Retained prebuilt decode blocks are not
-inserted into the local prefix cache and do not publish KV store events.
+budgets decline only the optimization; the completed model response still
+succeeds. Aborted, failed, or disconnected-before-terminal requests never
+schedule returns. Retained prebuilt decode blocks are not inserted into the
+decode cache and do not publish local KV store events.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
@@ -352,6 +361,16 @@ frontend --> PrefillRouter --> prefill worker   (max_tokens forced to 1)
                                     -> Success
                     decodes from a "prebuilt" batch, leading with the
                     token prefill actually produced
+                                    |
+                    terminal response is delivered with
+                    kv_return={status: scheduled, num_tokens, kv_bytes}
+                    only when a bounded background slot was accepted
+                                    |
+                    retain exact response-tail lease; asynchronously
+                    prepare -> simulate generated-KV transfer -> commit
+                                    |
+                    original prefill DP rank atomically imports new full
+                    blocks and publishes its normal BlockStored events
 ```
 
 `bootstrap_host == "2.2.2.2"` (SGLang's `FAKE_BOOTSTRAP_HOST`) short-circuits
@@ -359,12 +378,13 @@ the whole handshake. Dynamo's health-check canary and prefill warmup both use
 it; without that path, warmup would block for its 1800 s timeout. Sentinel
 requests never publish `kv_return` metadata.
 
-`--enable-kv-return` is disabled by default. On a real disaggregated prefill
-room with radix caching enabled, the bootstrap server asks that rank's return
-manager to issue the `kv_return` ticket placed in room metadata. The ticket has
-an unguessable nonce and attempt ID, exact room and prefill DP rank, cache
-namespace, token/byte/deadline limits, and the complete model/KV compatibility
-contract. No session ID is used.
+`--enable-kv-return` is disabled by default and must be enabled on both
+workers. On a real disaggregated prefill room with radix caching enabled, the
+bootstrap server asks that rank's return manager to issue the `kv_return`
+ticket placed in room metadata. The ticket has an unguessable nonce and
+attempt ID, exact room and prefill DP rank, cache namespace,
+token/byte/deadline limits, and the complete model/KV compatibility contract.
+No session ID is used.
 
 The prefill bootstrap HTTP server exposes the manager lifecycle directly:
 
@@ -391,11 +411,26 @@ deadline across all three phases, uses only generated-response KV bytes, uses
 the decode-to-prefill topology link when both locations are known, and
 best-effort aborts a prepared attempt when transfer or commit fails.
 
-This helper is intentionally not connected to decode completion. The scheduler
-now has an explicit prebuilt-request opt-in that can retain completed response
-KV, but it does not invoke the reverse client, schedule background return work,
-or add response metadata. Network return and end-to-end next-turn orchestration
-are not connected yet.
+Normal eligible decode completion is connected to that helper without joining
+it to response latency. Before yielding the terminal chunk, Engine validates
+the room ticket, obtains the exact response lease, and accepts the work only
+when the retention count/block/byte budgets and the per-rank background task
+bound allow it. The terminal response reports only `scheduled`; it never
+claims storage success. After terminal delivery, the tracked task starts the
+helper. Immediate next-turn routing may race that task and miss, while a later
+turn can reuse every newly imported full block at the ticket's original
+prefill DP rank.
+
+Prepare rejection, incompatibility, expiry, timeout, cancellation, transport
+or protocol failure, task rejection, and engine shutdown never change an
+already completed model response. Every outcome releases the lease. Shutdown
+cancels and awaits tracked tasks while the HTTP client is still open, allowing
+prepared attempts to be best-effort aborted before schedulers and sockets
+close.
+
+The reverse payload remains simulated; no response tensor bytes move between
+GPUs. Dynamo request schemas, per-request return policy, session affinity,
+decode rerouting, and topology-aware route selection remain out of scope.
 
 ## KV-aware routing
 
