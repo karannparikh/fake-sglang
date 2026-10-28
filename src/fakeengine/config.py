@@ -44,6 +44,10 @@ class SimConfig:
     kv_return_bytes_per_token: int
     kv_return_bandwidth_gb_s: float
     kv_return_overhead_ms: float
+    kv_return_retention_max_leases: int
+    kv_return_retention_max_blocks: int
+    kv_return_retention_max_bytes: int
+    kv_return_retention_timeout_ms: float
     speedup_ratio: float
 
     bootstrap_host: Optional[str]
@@ -177,6 +181,43 @@ class SimConfig:
                 "fake_bootstrap_timeout_s"
             )
 
+        retention_max_leases = _positive_int(
+            getattr(server_args, "fake_kv_return_retention_max_leases", 32),
+            "fake_kv_return_retention_max_leases",
+        )
+        retention_max_blocks = getattr(
+            server_args, "fake_kv_return_retention_max_blocks", None,
+        )
+        if retention_max_blocks is None:
+            retention_max_blocks = num_blocks
+        else:
+            retention_max_blocks = _positive_int(
+                retention_max_blocks,
+                "fake_kv_return_retention_max_blocks",
+            )
+        retention_max_bytes = getattr(
+            server_args, "fake_kv_return_retention_max_bytes", None,
+        )
+        if retention_max_bytes is None:
+            retention_max_bytes = (
+                retention_max_blocks * block_size * kv_bytes_per_token
+            )
+        else:
+            retention_max_bytes = _positive_int(
+                retention_max_bytes,
+                "fake_kv_return_retention_max_bytes",
+            )
+        retention_timeout = getattr(
+            server_args, "fake_kv_return_retention_timeout_ms", None,
+        )
+        if retention_timeout is None:
+            retention_timeout = return_deadline
+        else:
+            retention_timeout = _positive_finite_float(
+                retention_timeout,
+                "fake_kv_return_retention_timeout_ms",
+            )
+
         return cls(
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
@@ -209,6 +250,10 @@ class SimConfig:
             kv_return_bytes_per_token=return_bytes,
             kv_return_bandwidth_gb_s=return_bandwidth,
             kv_return_overhead_ms=return_overhead,
+            kv_return_retention_max_leases=retention_max_leases,
+            kv_return_retention_max_blocks=retention_max_blocks,
+            kv_return_retention_max_bytes=retention_max_bytes,
+            kv_return_retention_timeout_ms=retention_timeout,
             speedup_ratio=max(float(server_args.fake_speedup_ratio), 1e-6),
             bootstrap_host=None,
             bootstrap_port=int(server_args.disaggregation_bootstrap_port or 8998),
