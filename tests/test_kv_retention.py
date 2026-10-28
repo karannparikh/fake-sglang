@@ -20,14 +20,17 @@ class EventRecorder:
         self.removed.extend(block_ids)
 
 
-def scheduler_for(server_args, **overrides):
+def scheduler_for(server_args, *, clock=None, **overrides):
     settings = dict(
         page_size=4,
         fake_num_kv_blocks=8,
         fake_kv_return_retention_timeout_ms=1000,
     )
     settings.update(overrides)
-    return Scheduler(SimConfig.from_server_args(server_args(**settings)))
+    return Scheduler(
+        SimConfig.from_server_args(server_args(**settings)),
+        clock=clock,
+    )
 
 
 async def finish_prebuilt(
@@ -161,6 +164,52 @@ async def test_scheduler_loop_expires_idle_lease_without_a_new_request(server_ar
         assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
     finally:
         await scheduler.stop()
+
+
+async def test_expiry_during_decode_sleep_releases_capacity_before_growth(
+    server_args,
+):
+    now = [100.0]
+    scheduler = scheduler_for(
+        server_args,
+        clock=lambda: now[0],
+        fake_num_kv_blocks=2,
+        fake_kv_return_retention_timeout_ms=100,
+    )
+    retained = await finish_prebuilt(
+        scheduler,
+        list(range(4)),
+        1,
+        rid="retained",
+    )
+    lease = retained.retention_lease
+    contender = scheduler.submit(Request(
+        "contender",
+        list(range(4)),
+        2,
+        prebuilt=True,
+        first_token=23,
+    ))
+    assert await scheduler._prefill_step()
+    assert contender in scheduler.running
+    assert not lease.released
+    assert not scheduler.pool.can_allocate(1)
+
+    async def cross_lease_deadline(_milliseconds):
+        await asyncio.sleep(0)
+        now[0] = lease.deadline
+
+    scheduler.timing.sleep_ms = cross_lease_deadline
+    await scheduler._decode_step()
+
+    assert lease.released
+    assert lease.release_reason == "expired"
+    assert contender.finished
+    events = [contender.queue.get_nowait() for _ in range(3)]
+    assert events[0] == ("token", 23)
+    assert events[1][0] == "token"
+    assert events[2] == ("done", "length")
+    assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
 
 
 async def test_abort_cancel_and_opt_out_create_no_lease(server_args):
@@ -310,4 +359,41 @@ async def test_decode_engine_opt_in_exposes_lease_without_response_metadata(
         )
         assert lease.cache_salt == "tenant-b"
     finally:
+        await engine._async_shutdown()
+
+
+async def test_decode_stream_close_before_terminal_delivery_releases_lease(
+    server_args,
+):
+    engine = Engine(server_args(
+        disaggregation_mode="decode",
+        page_size=4,
+        fake_num_kv_blocks=4,
+        fake_kv_return_retention_timeout_ms=10_000,
+    ))
+    stream = await engine.async_generate(
+        input_ids=list(range(5)),
+        sampling_params={"max_new_tokens": 2},
+        rid="closed-before-terminal",
+        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        bootstrap_room=8,
+        retain_response_kv=True,
+    )
+    try:
+        first = await asyncio.wait_for(anext(stream), 1)
+        assert first["meta_info"]["finish_reason"] is None
+        lease = engine.scheduler.get_retention_lease("closed-before-terminal")
+        assert lease is not None
+        assert not lease.released
+
+        await stream.aclose()
+
+        assert lease.released
+        assert lease.release_reason == "undelivered"
+        assert engine.scheduler.active_retention_leases == ()
+        assert engine.scheduler.pool.can_allocate(
+            engine.scheduler.pool.num_blocks
+        )
+    finally:
+        await stream.aclose()
         await engine._async_shutdown()

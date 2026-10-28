@@ -561,11 +561,19 @@ class Engine:
             retain_response_kv=retain_response_kv,
         )
         scheduler.submit(request)
+        terminal_delivered = False
         try:
             async for chunk in self._drain(request, started):
+                if chunk["meta_info"]["finish_reason"] is not None:
+                    terminal_delivered = True
                 yield chunk
         finally:
             scheduler.abort(request_id)
+            if request.retention_lease is not None and not terminal_delivered:
+                scheduler.release_retention(
+                    request.retention_lease,
+                    reason="undelivered",
+                )
 
     async def _drain(self, request: Request, started: float) -> AsyncIterator[dict]:
         """Turn separated per-request outputs into SGLang response chunks."""
