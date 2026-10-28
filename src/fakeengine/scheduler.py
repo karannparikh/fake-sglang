@@ -47,6 +47,44 @@ FINISH_STOP = "stop"
 FINISH_LENGTH = "length"
 FINISH_ABORT = "abort"
 
+_KV_RETURN_REJECTION_REASONS = frozenset({
+    "invalid_ticket",
+    "invalid_payload",
+    "task_limit",
+    "task_creation",
+    "shutdown",
+    "retention_capacity",
+    "retention_lease_budget",
+    "retention_block_budget",
+    "retention_byte_budget",
+    "retention_duplicate_request",
+    "prepare_disabled",
+    "prepare_expired",
+    "prepare_capacity_rejected",
+    "prepare_incompatible",
+    "prepare_not_found",
+    "commit_disabled",
+    "commit_expired",
+    "commit_capacity_rejected",
+    "commit_incompatible",
+    "commit_invalid_token_ids",
+    "commit_checksum_mismatch",
+    "commit_not_prepared",
+    "commit_import_failed",
+    "commit_not_found",
+    "other",
+})
+_KV_RETURN_FAILURE_REASONS = frozenset({
+    "prepare_timeout",
+    "transfer_timeout",
+    "commit_timeout",
+    "deadline_timeout",
+    "transport",
+    "protocol",
+    "cancelled",
+    "unexpected",
+})
+
 
 @dataclass
 class PrefixImportReservation:
@@ -273,7 +311,17 @@ class Scheduler:
         self._retained_blocks = 0
         self._retained_bytes = 0
         self._retention_rejections = 0
+        self._kv_return_attempts = 0
+        self._kv_return_stored = 0
+        self._kv_return_rejected_by_reason: Dict[str, int] = {}
+        self._kv_return_failed_by_reason: Dict[str, int] = {}
+        self._kv_return_tokens = 0
+        self._kv_return_bytes = 0
+        self._kv_return_transfer_ms = 0.0
+        self._kv_return_commit_ms = 0.0
+        self._kv_return_active_tasks = 0
         self._clock = clock or time.monotonic
+        self._publish_kv_return_state()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -386,6 +434,7 @@ class Scheduler:
         self._retained_blocks -= lease.block_count
         self._retained_bytes -= lease.retained_bytes
         self.pool.free(lease.block_ids)
+        self._publish_kv_return_state()
         return True
 
     def expire_retention_leases(self, now: Optional[float] = None) -> int:
@@ -518,6 +567,62 @@ class Scheduler:
 
     # -- stats -------------------------------------------------------------
 
+    def record_kv_return_attempt(self) -> None:
+        self._kv_return_attempts += 1
+        self._kv_return_active_tasks += 1
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_attempt()
+        self._publish_kv_return_state()
+
+    def record_kv_return_task_finished(self) -> None:
+        if self._kv_return_active_tasks > 0:
+            self._kv_return_active_tasks -= 1
+        self._publish_kv_return_state()
+
+    def record_kv_return_stored(
+        self,
+        *,
+        tokens: int,
+        payload_bytes: int,
+        transfer_ms: float,
+        commit_ms: float,
+    ) -> None:
+        self._kv_return_stored += 1
+        self._kv_return_tokens += tokens
+        self._kv_return_bytes += payload_bytes
+        self._kv_return_transfer_ms += transfer_ms
+        self._kv_return_commit_ms += commit_ms
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_stored(
+                tokens,
+                payload_bytes,
+                transfer_ms,
+                commit_ms,
+            )
+
+    def record_kv_return_rejected(self, reason: str) -> None:
+        bounded = reason if reason in _KV_RETURN_REJECTION_REASONS else "other"
+        self._kv_return_rejected_by_reason[bounded] = (
+            self._kv_return_rejected_by_reason.get(bounded, 0) + 1
+        )
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_rejected(bounded)
+
+    def record_kv_return_failed(self, reason: str) -> None:
+        bounded = reason if reason in _KV_RETURN_FAILURE_REASONS else "unexpected"
+        self._kv_return_failed_by_reason[bounded] = (
+            self._kv_return_failed_by_reason.get(bounded, 0) + 1
+        )
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_failed(bounded)
+
+    def _publish_kv_return_state(self) -> None:
+        if self.cache_metrics is not None:
+            self.cache_metrics.update_kv_return(
+                active_tasks=self._kv_return_active_tasks,
+                retained_blocks=self._retained_blocks,
+            )
+
     def _publish_cache_state(self) -> None:
         if self.cache_metrics is not None:
             self.cache_metrics.update_pool(self.pool)
@@ -543,6 +648,19 @@ class Scheduler:
             "kv_retention_blocks": self._retained_blocks,
             "kv_retention_bytes": self._retained_bytes,
             "kv_retention_rejections": self._retention_rejections,
+            "kv_return_attempts": self._kv_return_attempts,
+            "kv_return_stored": self._kv_return_stored,
+            "kv_return_rejected_by_reason": dict(
+                self._kv_return_rejected_by_reason
+            ),
+            "kv_return_failed_by_reason": dict(
+                self._kv_return_failed_by_reason
+            ),
+            "kv_return_tokens": self._kv_return_tokens,
+            "kv_return_bytes": self._kv_return_bytes,
+            "kv_return_transfer_ms": self._kv_return_transfer_ms,
+            "kv_return_commit_ms": self._kv_return_commit_ms,
+            "kv_return_active_tasks": self._kv_return_active_tasks,
         }
 
     # -- the loop ----------------------------------------------------------
@@ -1000,6 +1118,7 @@ class Scheduler:
         self._retained_blocks += block_count
         self._retained_bytes += retained_bytes
         request.retention_lease = lease
+        self._publish_kv_return_state()
         self._wakeup.set()
         return lease
 

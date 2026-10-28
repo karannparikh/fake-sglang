@@ -70,6 +70,58 @@ class PrefixCacheMetrics:
             prefix + "cleared_tokens", "Prefix tokens removed by explicit cache clears, not allocation pressure.",
             ["dp_rank"], registry=None,
         ).labels(str(dp_rank))
+        return_prefix = "sglang:simulated_kv_return_"
+        self.kv_return_attempts = Counter(
+            return_prefix + "attempts",
+            "Background response-KV return tasks accepted for scheduling.",
+            ["dp_rank"], registry=None,
+        ).labels(str(dp_rank))
+        self.kv_return_stored = Counter(
+            return_prefix + "stored",
+            "Response-KV returns committed at the original prefill rank.",
+            ["dp_rank"], registry=None,
+        ).labels(str(dp_rank))
+        self.kv_return_rejected = Counter(
+            return_prefix + "rejected",
+            "Response-KV returns rejected before storage, by bounded reason.",
+            ["dp_rank", "reason"], registry=None,
+        )
+        self.kv_return_failed = Counter(
+            return_prefix + "failed",
+            "Response-KV background failures, by bounded reason.",
+            ["dp_rank", "reason"], registry=None,
+        )
+        self.kv_return_tokens = Counter(
+            return_prefix + "tokens",
+            "Generated response tokens successfully returned.",
+            ["dp_rank"], registry=None,
+        ).labels(str(dp_rank))
+        self.kv_return_bytes = Counter(
+            return_prefix + "bytes",
+            "Simulated response-KV payload bytes successfully returned.",
+            ["dp_rank"], registry=None,
+        ).labels(str(dp_rank))
+        self.kv_return_transfer_seconds = Counter(
+            return_prefix + "transfer_seconds",
+            "Modeled response-KV transfer seconds for completed attempts.",
+            ["dp_rank"], registry=None,
+        ).labels(str(dp_rank))
+        self.kv_return_commit_seconds = Counter(
+            return_prefix + "commit_seconds",
+            "Control-plane commit seconds for completed attempts.",
+            ["dp_rank"], registry=None,
+        ).labels(str(dp_rank))
+        self.kv_return_active_tasks = Gauge(
+            return_prefix + "active_tasks",
+            "Tracked response-KV background tasks.",
+            ["dp_rank"], registry=None, multiprocess_mode="livemostrecent",
+        ).labels(str(dp_rank))
+        self.kv_return_retained_blocks = Gauge(
+            return_prefix + "retained_blocks",
+            "Decode KV blocks held by response-retention leases.",
+            ["dp_rank"], registry=None, multiprocess_mode="livemostrecent",
+        ).labels(str(dp_rank))
+        self._dp_rank = str(dp_rank)
         self._last_evicted = self._last_cleared = 0
 
     def observe(self, prompt_tokens: int, hit_tokens: int) -> None:
@@ -90,3 +142,34 @@ class PrefixCacheMetrics:
         self.evicted_tokens.inc((pool.evicted_blocks - self._last_evicted) * pool.block_size)
         self.cleared_tokens.inc((pool.cleared_blocks - self._last_cleared) * pool.block_size)
         self._last_evicted, self._last_cleared = pool.evicted_blocks, pool.cleared_blocks
+
+    def record_kv_return_attempt(self) -> None:
+        self.kv_return_attempts.inc()
+
+    def record_kv_return_stored(
+        self,
+        tokens: int,
+        payload_bytes: int,
+        transfer_ms: float,
+        commit_ms: float,
+    ) -> None:
+        self.kv_return_stored.inc()
+        self.kv_return_tokens.inc(tokens)
+        self.kv_return_bytes.inc(payload_bytes)
+        self.kv_return_transfer_seconds.inc(transfer_ms / 1000.0)
+        self.kv_return_commit_seconds.inc(commit_ms / 1000.0)
+
+    def record_kv_return_rejected(self, reason: str) -> None:
+        self.kv_return_rejected.labels(self._dp_rank, reason).inc()
+
+    def record_kv_return_failed(self, reason: str) -> None:
+        self.kv_return_failed.labels(self._dp_rank, reason).inc()
+
+    def update_kv_return(
+        self,
+        *,
+        active_tasks: int,
+        retained_blocks: int,
+    ) -> None:
+        self.kv_return_active_tasks.set(active_tasks)
+        self.kv_return_retained_blocks.set(retained_blocks)
