@@ -254,6 +254,9 @@ class Engine:
                     self.sim_config.bootstrap_host,
                     self.sim_config.bootstrap_port,
                     room_ttl_s=max(self.sim_config.bootstrap_timeout_s * 4, 60.0),
+                    kv_return_managers=[
+                        scheduler.kv_return for scheduler in self.schedulers
+                    ],
                 )
             elif self.disaggregation_mode == "decode":
                 self._bootstrap_client = BootstrapClient(
@@ -485,6 +488,8 @@ class Engine:
                 self._bootstrap_server,
                 bootstrap_room,
                 dp_rank=dp_rank,
+                prompt_ids=request.prompt_ids,
+                cache_salt=request.cache_salt,
             )
 
         published = False
