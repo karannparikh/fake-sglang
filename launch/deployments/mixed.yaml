@@ -1,0 +1,23 @@
+# Prefill, decode and aggregated workers serving one model.
+#
+# Dynamo keeps aggregated workers in their own worker set next to the
+# prefill->decode set and splits requests between the sets, so the two agg
+# workers here take traffic as a group rather than joining the decode pool.
+#
+#   ./launch/deployment.sh launch/deployments/mixed.yaml
+
+frontend:
+  router_mode: kv
+
+topology:
+  levels: [cluster, zone]
+  links:
+    zone:    {bandwidth_gb_s: 450, latency_ms: 0.01}
+    cluster: {bandwidth_gb_s: 50,  latency_ms: 0.05}
+    default: {bandwidth_gb_s: 12.5, latency_ms: 0.5}
+
+workers:
+  - {role: prefill, count: 2, location: cluster-1/zone-1}
+  - {role: decode,  count: 2, location: cluster-1/zone-2}
+  - {role: decode,  count: 1, location: cluster-2/zone-1, args: [--fake-itl-ms, 12]}
+  - {role: agg,     count: 2, location: cluster-2/zone-2}

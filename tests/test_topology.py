@@ -1,7 +1,7 @@
 """Distance-dependent KV transfer.
 
 The link a handoff crosses is decided by where the two workers sit, so the same
-prompt must cost more to move between zones than within a node -- otherwise a
+prompt must cost more to move between regions than within a zone -- otherwise a
 topology-aware router has nothing to win and a topology-blind one nothing to
 lose.
 """
@@ -18,11 +18,11 @@ from fakeengine.topology import DEFAULT_LINK, Topology, TopologyError
 from test_disagg import PROMPT, _collect
 
 TOPOLOGY = {
-    "levels": ["zone", "rack", "node"],
+    "levels": ["region", "cluster", "zone"],
     "links": {
-        "node": {"bandwidth_gb_s": 400, "latency_ms": 0.01},
-        "rack": {"bandwidth_gb_s": 50, "latency_ms": 0.05},
-        "zone": {"bandwidth_gb_s": 10, "latency_ms": 0.5},
+        "zone": {"bandwidth_gb_s": 400, "latency_ms": 0.01},
+        "cluster": {"bandwidth_gb_s": 50, "latency_ms": 0.05},
+        "region": {"bandwidth_gb_s": 10, "latency_ms": 0.5},
         "default": {"bandwidth_gb_s": 1, "latency_ms": 5},
     },
 }
@@ -31,10 +31,10 @@ TOPOLOGY = {
 @pytest.mark.parametrize(
     "a, b, expected",
     [
-        ("z1/r1/n1", "z1/r1/n1", "node"),
-        ("z1/r1/n1", "z1/r1/n2", "rack"),
-        ("z1/r1/n1", "z1/r2/n1", "zone"),
-        ("z1/r1/n1", "z2/r1/n1", DEFAULT_LINK),
+        ("r1/c1/z1", "r1/c1/z1", "zone"),
+        ("r1/c1/z1", "r1/c1/z2", "cluster"),
+        ("r1/c1/z1", "r1/c2/z1", "region"),
+        ("r1/c1/z1", "r2/c1/z1", DEFAULT_LINK),
     ],
 )
 def test_link_is_the_deepest_shared_level(a, b, expected):
@@ -44,19 +44,19 @@ def test_link_is_the_deepest_shared_level(a, b, expected):
 
 
 def test_same_names_in_different_parents_are_not_the_same_place():
-    """rack-1 in zone A and rack-1 in zone B share nothing."""
+    """cluster-1 in region A and cluster-1 in region B share nothing."""
     topo = Topology.from_dict(TOPOLOGY)
-    assert topo.link_between("a/rack-1/n1", "b/rack-1/n1").name == DEFAULT_LINK
+    assert topo.link_between("a/cluster-1/z1", "b/cluster-1/z1").name == DEFAULT_LINK
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda t: t["links"].pop("rack"),
+        lambda t: t["links"].pop("cluster"),
         lambda t: t["links"].update(extra={"bandwidth_gb_s": 1}),
-        lambda t: t["links"]["node"].update(bandwidth_gb_s=0),
+        lambda t: t["links"]["zone"].update(bandwidth_gb_s=0),
         lambda t: t.update(levels=[]),
-        lambda t: t.update(levels=["zone", "zone", "node"]),
+        lambda t: t.update(levels=["region", "region", "zone"]),
     ],
 )
 def test_malformed_topology_is_rejected(mutate):
@@ -69,7 +69,7 @@ def test_malformed_topology_is_rejected(mutate):
 def test_location_depth_must_match_levels():
     topo = Topology.from_dict(TOPOLOGY)
     with pytest.raises(TopologyError):
-        topo.link_between("z1/r1", "z1/r1/n1")
+        topo.link_between("r1/c1", "r1/c1/z1")
 
 
 def test_worker_with_bad_location_fails_at_startup(server_args):
@@ -77,7 +77,7 @@ def test_worker_with_bad_location_fails_at_startup(server_args):
         Engine(
             server_args=server_args(
                 disaggregation_mode="decode",
-                fake_location="z1/r1",
+                fake_location="r1/c1",
                 fake_topology=json.dumps(TOPOLOGY),
             )
         )
@@ -113,7 +113,7 @@ async def test_transfer_cost_grows_with_distance(server_args, unused_port):
         server_args=server_args(
             disaggregation_mode="prefill",
             disaggregation_bootstrap_port=unused_port,
-            fake_location="z1/r1/n1",
+            fake_location="r1/c1/z1",
             **placed,
         )
     )
@@ -124,10 +124,10 @@ async def test_transfer_cost_grows_with_distance(server_args, unused_port):
             )
         )
         for name, loc in [
-            ("node", "z1/r1/n1"),
-            ("rack", "z1/r1/n2"),
-            ("zone", "z1/r2/n1"),
-            (DEFAULT_LINK, "z2/r1/n1"),
+            ("zone", "r1/c1/z1"),
+            ("cluster", "r1/c1/z2"),
+            ("region", "r1/c2/z1"),
+            (DEFAULT_LINK, "r2/c1/z1"),
         ]
     }
     try:
@@ -138,7 +138,7 @@ async def test_transfer_cost_grows_with_distance(server_args, unused_port):
         assert {name: r["link"] for name, r in results.items()} == {
             name: name for name in results
         }
-        costs = [results[n]["transfer_ms"] for n in ("node", "rack", "zone", DEFAULT_LINK)]
+        costs = [results[n]["transfer_ms"] for n in ("zone", "cluster", "region", DEFAULT_LINK)]
         assert costs == sorted(costs) and len(set(costs)) == 4
     finally:
         await prefill._async_shutdown()
@@ -158,7 +158,7 @@ async def test_unplaced_workers_keep_the_global_link(server_args, unused_port):
     decode = Engine(
         server_args=server_args(
             disaggregation_mode="decode",
-            fake_location="z1/r1/n1",
+            fake_location="r1/c1/z1",
             fake_topology=json.dumps(TOPOLOGY),
         )
     )

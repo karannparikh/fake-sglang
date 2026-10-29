@@ -1,0 +1,30 @@
+# Prefill and decode workers in two network zones, and KV never leaves a zone.
+#
+# Crossing zones is priced as effectively infinite, so the only acceptable
+# handoff is one within a zone. topology.kv_transfer makes Dynamo's router
+# enforce that: once it picks a prefill worker, only decode workers in the
+# same zone are eligible. Every handoff should log "over 'zone' link":
+#
+#   ./launch/deployment.sh launch/deployments/zone-local.yaml --log-dir runs/1
+#   grep -h "KV room" runs/1/decode-*.log | grep -o "over '[a-z]*'" | sort | uniq -c
+#
+# Remove the kv_transfer line to see the topology-blind baseline, where about
+# half of the handoffs take the 'default' (cross-zone) link.
+
+frontend:
+  router_mode: kv                 # required by kv_transfer
+
+topology:
+  levels: [zone]
+  links:
+    zone:    {bandwidth_gb_s: 50,    latency_ms: 0.05}      # within a zone
+    default: {bandwidth_gb_s: 0.001, latency_ms: 1000000}   # across zones: ~17 min, never worth it
+  # required: decode must be in the prefill worker's zone.
+  # preferred: same-zone decode is favoured; add preferred_weight (0 to 1).
+  kv_transfer: {domain: zone, enforcement: required}
+
+workers:
+  - {role: prefill, count: 1, location: zone-a}
+  - {role: decode,  count: 2, location: zone-a}
+  - {role: prefill, count: 1, location: zone-b}
+  - {role: decode,  count: 2, location: zone-b}

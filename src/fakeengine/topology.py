@@ -1,21 +1,21 @@
 """Network distance between workers, for distance-dependent KV transfer.
 
-A *location* is a path such as ``zone-a/rack-1/node-2``, one component per
+A *location* is a path such as ``region-a/cluster-1/zone-2``, one component per
 topology level (outermost first). Two workers are as close as the deepest level
 their paths share, and that level names the *link* a KV transfer between them
 crosses:
 
-    levels: [zone, rack, node]
+    levels: [region, cluster, zone]
     links:
-      node:    same node              (all three components equal)
-      rack:    same rack, other node  (zone and rack equal)
-      zone:    same zone, other rack  (zone equal)
+      zone:    same zone                    (all three components equal)
+      cluster: same cluster, other zone     (region and cluster equal)
+      region:  same region, other cluster   (region equal)
       default: nothing shared
 
 Each link has its own bandwidth and fixed latency, replacing the single global
 ``--fake-kv-bandwidth-gb-s`` / ``--fake-kv-transfer-overhead-ms`` for transfers
 where both ends have a location. The topology arrives as one JSON document
-(``--fake-topology``) so every worker in a cluster shares the same table.
+(``--fake-topology``) so every worker in a launch shares the same table.
 """
 
 from __future__ import annotations

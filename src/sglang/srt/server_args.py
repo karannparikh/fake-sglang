@@ -134,7 +134,7 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     # Natural output length: unset = every request runs to max_new_tokens.
     ("fake_output_len_median", "float", None, None),
     ("fake_output_len_sigma", "float", 1.0, None),
-    # Network placement: this worker's location path and the cluster-wide link
+    # Network placement: this worker's location path and the deployment-wide link
     # table (JSON, see fakeengine/topology.py). Both unset = one global link.
     ("fake_location", "str", None, None),
     ("fake_topology", "str", None, None),
