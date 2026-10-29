@@ -26,6 +26,16 @@ def test_stream_interval_must_be_a_positive_integer(server_args, value):
         _config(server_args, stream_interval=value)
 
 
+async def test_stream_interval_sends_first_and_all_unsent_tokens():
+    request = Request("interval", [1], 10)
+
+    request.publish_output([10], None, stream_interval=3)
+    assert await request.next_output() == ([10], None)
+
+    request.publish_output([11, 12, 13, 14], None, stream_interval=3)
+    assert await request.next_output() == ([11, 12, 13, 14], None)
+
+
 async def test_scheduler_publishes_cross_request_output_batches(server_args):
     config = _config(server_args)
     scheduler = Scheduler(config)
@@ -85,14 +95,14 @@ async def test_stream_interval_batches_and_flushes_terminal_tail(server_args):
         )
         chunks = [chunk async for chunk in stream]
 
-        assert [len(chunk["output_ids"]) for chunk in chunks] == [3, 3, 2]
+        assert [len(chunk["output_ids"]) for chunk in chunks] == [1, 3, 3, 1]
         assert [
             chunk["meta_info"]["completion_tokens"] for chunk in chunks
-        ] == [3, 6, 8]
-        assert [chunk["meta_info"]["finish_reason"] for chunk in chunks[:-1]] == [
-            None,
-            None,
-        ]
+        ] == [1, 4, 7, 8]
+        assert all(
+            chunk["meta_info"]["finish_reason"] is None
+            for chunk in chunks[:-1]
+        )
         assert chunks[-1]["meta_info"]["finish_reason"]["type"] == "length"
     finally:
         await engine._async_shutdown()
@@ -116,10 +126,17 @@ async def test_abort_flushes_unsent_output_with_finish_reason(server_args):
         chunks = [await first_chunk]
         chunks.extend([chunk async for chunk in stream])
 
-        assert len(chunks) == 1
-        assert chunks[0]["output_ids"] == expected
-        assert chunks[0]["meta_info"]["completion_tokens"] == len(expected)
-        assert chunks[0]["meta_info"]["finish_reason"]["type"] == "abort"
+        assert [len(chunk["output_ids"]) for chunk in chunks] == [
+            1,
+            len(expected) - 1,
+        ]
+        assert [
+            token
+            for chunk in chunks
+            for token in chunk["output_ids"]
+        ] == expected
+        assert chunks[-1]["meta_info"]["completion_tokens"] == len(expected)
+        assert chunks[-1]["meta_info"]["finish_reason"]["type"] == "abort"
     finally:
         await engine._async_shutdown()
 
@@ -170,8 +187,8 @@ async def test_packed_dp_ranks_batch_outputs_independently(server_args):
             generate(1, "rank-1", [4, 5, 6]),
         )
 
-        assert [len(chunk["output_ids"]) for chunk in first] == [2, 1]
-        assert [len(chunk["output_ids"]) for chunk in second] == [2, 1]
+        assert [len(chunk["output_ids"]) for chunk in first] == [1, 2]
+        assert [len(chunk["output_ids"]) for chunk in second] == [1, 2]
         assert {chunk["meta_info"]["id"] for chunk in first} == {"rank-0"}
         assert {chunk["meta_info"]["id"] for chunk in second} == {"rank-1"}
         assert engine.schedulers[0]._output_queue is not engine.schedulers[1]._output_queue

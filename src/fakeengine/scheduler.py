@@ -48,10 +48,11 @@ FINISH_ABORT = "abort"
 class Request:
     __slots__ = (
         "_cache_observed", "_hashes", "_output_event", "_output_ready",
-        "_output_reason", "_output_tokens", "_stream", "arrival", "blocks",
-        "cache_salt", "cached_tokens", "finished", "first_token", "generated",
-        "ignore_eos", "max_new_tokens", "min_new_tokens", "observe_cache",
-        "prebuilt", "prefilled", "prompt_ids", "rid", "stop_after",
+        "_output_reason", "_output_started", "_output_tokens", "_stream",
+        "arrival", "blocks", "cache_salt", "cached_tokens", "finished",
+        "first_token", "generated", "ignore_eos", "max_new_tokens",
+        "min_new_tokens", "observe_cache", "prebuilt", "prefilled",
+        "prompt_ids", "rid", "stop_after",
     )
 
     def __init__(
@@ -92,6 +93,7 @@ class Request:
         self._output_tokens: list[int] = []
         self._output_ready = 0
         self._output_reason: str | None = None
+        self._output_started = False
         self._output_event = asyncio.Event()
 
     @property
@@ -122,8 +124,11 @@ class Request:
         if finish_reason is not None:
             self._output_ready = len(self._output_tokens)
             self._output_reason = finish_reason
+        elif not self._output_started and unsent > 0:
+            self._output_ready = len(self._output_tokens)
+            self._output_started = True
         elif unsent >= stream_interval:
-            self._output_ready += unsent // stream_interval * stream_interval
+            self._output_ready = len(self._output_tokens)
         else:
             return
         self._output_event.set()
