@@ -200,7 +200,7 @@ async def test_disabled_feature_preserves_legacy_room_routes(
             ) as response:
                 room = await response.json()
 
-    assert "kv_return" not in room
+    assert room["kv_return"] is None
     assert room["first_token"] == 7
     assert scheduler.kv_return._attempts == {}
 
@@ -429,4 +429,4 @@ async def test_protocol_limits_are_enforced_before_manager_dispatch(
         kv_return_prompt_ids=(1, 2, 3, 4),
         kv_return_cache_salt=oversized,
     )
-    assert "kv_return" not in server._rooms[71]
+    assert server._rooms[71]["kv_return"] is None

@@ -534,8 +534,9 @@ Dynamo a stub `torch`. Any real call into the stub raises an error. Set
 ## Tests
 
 ```bash
-pytest tests/
-pytest ../dynamo/components/src/dynamo/sglang/tests -m unit      # 1006 pass, 7 fail (below)
+python -m ruff check .
+python -m pytest tests/
+python -m pytest ../dynamo/components/src/dynamo/sglang/tests -m unit  # 1006 pass, 7 fail (below)
 ```
 
 Counts are against Dynamo `2db5333ef6`.
