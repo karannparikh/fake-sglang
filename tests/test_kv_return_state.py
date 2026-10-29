@@ -193,6 +193,25 @@ def test_expiry_releases_capacity_and_is_idempotent(server_args):
     assert scheduler.kv_return.commit(commit).status == KVReturnStatus.EXPIRED
 
 
+def test_prepare_uses_one_deadline_snapshot(server_args):
+    now = [10.0]
+    scheduler, _ = _scheduler(server_args, clock=lambda: now[0])
+    _seed(scheduler)
+    ticket = _ticket(scheduler)
+    clock_reads = [0]
+
+    def crossing_deadline():
+        clock_reads[0] += 1
+        return 10.099 if clock_reads[0] == 1 else 10.1
+
+    scheduler.kv_return._clock = crossing_deadline
+
+    result = scheduler.kv_return.prepare(_prepare(ticket))
+
+    assert result.status == KVReturnStatus.PREPARED
+    assert clock_reads[0] == 1
+
+
 @pytest.mark.parametrize(
     "case,expected",
     [

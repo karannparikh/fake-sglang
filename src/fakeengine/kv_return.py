@@ -208,7 +208,8 @@ class KVReturnManager:
 
     def prepare(self, prepare: KVReturnPrepare) -> KVReturnResult:
         """Validate controls and reserve capacity before any transfer."""
-        self.expire()
+        now = self._clock()
+        self.expire(now)
         nonce = prepare.ticket.nonce
         terminal = self._terminal.get(nonce)
         if terminal is not None:
@@ -229,7 +230,7 @@ class KVReturnManager:
                 attempt,
                 KVReturnStatus.INCOMPATIBLE,
             )
-        if not self._valid_prepare(attempt, prepare):
+        if not self._valid_prepare(attempt, prepare, now):
             return self._finish(
                 attempt, KVReturnStatus.INCOMPATIBLE,
                 prepare=prepare,
@@ -267,7 +268,8 @@ class KVReturnManager:
         """Validate a prepared attempt and atomically import its token tail."""
         prepare = commit.prepare
         nonce = prepare.ticket.nonce
-        self.expire()
+        now = self._clock()
+        self.expire(now)
         terminal = self._terminal.get(nonce)
         if terminal is not None:
             return self._terminal_result(terminal, prepare=prepare, commit=commit)
@@ -279,7 +281,7 @@ class KVReturnManager:
                 attempt,
                 (
                     KVReturnStatus.NOT_PREPARED
-                    if self._valid_prepare(attempt, prepare)
+                    if self._valid_prepare(attempt, prepare, now)
                     else KVReturnStatus.INCOMPATIBLE
                 ),
                 prepare=prepare,
@@ -348,19 +350,19 @@ class KVReturnManager:
             )
         return self._finish(attempt, KVReturnStatus.ABORTED)
 
-    def expire(self) -> int:
+    def expire(self, now: Optional[float] = None) -> int:
         """Expire active attempts and purge bounded idempotency records."""
-        now = self._clock()
-        self._purge_terminals(now)
+        current = self._clock() if now is None else now
+        self._purge_terminals(current)
         expired = [
             attempt for attempt in self._attempts.values()
-            if now >= attempt.expires_at
+            if current >= attempt.expires_at
         ]
         for attempt in sorted(expired, key=lambda item: (item.expires_at, item.ticket.nonce)):
             self._finish(
                 attempt,
                 KVReturnStatus.EXPIRED,
-                now=now,
+                now=current,
             )
         return len(expired)
 
@@ -374,7 +376,12 @@ class KVReturnManager:
         self._attempts.clear()
         self._terminal.clear()
 
-    def _valid_prepare(self, attempt: _Attempt, prepare: KVReturnPrepare) -> bool:
+    def _valid_prepare(
+        self,
+        attempt: _Attempt,
+        prepare: KVReturnPrepare,
+        now: float,
+    ) -> bool:
         ticket = prepare.ticket
         count = prepare.generated_token_count
         valid_count = (
@@ -397,7 +404,7 @@ class KVReturnManager:
             and prepare.claimed_payload_bytes == expected_bytes
             and expected_bytes <= ticket.max_payload_bytes
             and _valid_checksum(prepare.token_ids_checksum)
-            and self._clock() < attempt.expires_at
+            and now < attempt.expires_at
         )
 
     def _finish(
