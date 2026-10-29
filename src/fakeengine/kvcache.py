@@ -10,8 +10,9 @@ pressure or reuse of a block that was merely unreferenced.
 from __future__ import annotations
 
 import hashlib
+import heapq
 from collections import OrderedDict
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 
 def namespace_seed(cache_salt: Optional[str]) -> bytes:
@@ -90,6 +91,11 @@ class BlockPool:
     appeared.
 
     ``on_evict`` receives the external ids of blocks that have left the cache.
+
+    Every operation is independent of the pool size: the evictable count is
+    kept as a running total, and eviction pops the least recently used
+    evictable leaf from a heap keyed by access tick. A pool holds tens of
+    thousands of blocks, and the scheduler queries it on every step.
     """
 
     def __init__(
@@ -106,10 +112,19 @@ class BlockPool:
         self.evicted_blocks = 0
         self.cleared_blocks = 0
         self._free_clean: List[int] = list(range(num_blocks))
+        self._free_clean_set: Set[int] = set(self._free_clean)
         self._cached: "OrderedDict[bytes, int]" = OrderedDict()  # digest -> block
         self._block_to_digest: Dict[int, bytes] = {}
         self._parents: Dict[bytes, Optional[bytes]] = {}
+        self._children: Dict[bytes, int] = {}  # digest -> number of cached children
         self._refcount: Dict[int, int] = {}
+        # Last-access tick per cached digest; ticks increase in ``_cached`` order.
+        self._ticks: Dict[bytes, int] = {}
+        self._tick = 0
+        self._evictable = 0  # cached blocks with no reference
+        # (tick, digest) of evictable leaves. Entries go stale when the digest is
+        # touched, referenced, gains a child or leaves; ``_evict_one`` skips them.
+        self._leaves: List[Tuple[int, bytes]] = []
 
     # -- capacity ----------------------------------------------------------
 
@@ -154,7 +169,8 @@ class BlockPool:
                 self._notify_evicted(evicted)
                 return None
             block = self._free_clean.pop()
-            self._refcount[block] = self._refcount.get(block, 0) + 1
+            self._free_clean_set.discard(block)
+            self._ref(block)
             blocks.append(block)
 
         self._notify_evicted(evicted)
@@ -166,18 +182,19 @@ class BlockPool:
             if remaining > 0:
                 self._refcount[block] = remaining
                 continue
-            self._refcount.pop(block, None)
+            if self._refcount.pop(block, 0) > 0:
+                self._unreferenced(block)
             # A block still holding a cached prefix stays reusable rather than
             # going back to the clean pool; only eviction clears it.
-            if block not in self._block_to_digest and block not in self._free_clean:
-                self._free_clean.append(block)
+            if block not in self._block_to_digest:
+                self._add_clean(block)
         self._notify_changed()
 
     def _release(self, blocks: Sequence[int]) -> None:
         for block in blocks:
-            self._refcount.pop(block, None)
-            if block not in self._free_clean:
-                self._free_clean.append(block)
+            if self._refcount.pop(block, 0) > 0:
+                self._unreferenced(block)
+            self._add_clean(block)
 
     # -- prefix cache ------------------------------------------------------
 
@@ -188,7 +205,7 @@ class BlockPool:
         for digest in hashes:
             if digest not in self._cached:
                 break
-            self._cached.move_to_end(digest)
+            self._touch(digest)
             matched += 1
         return matched
 
@@ -205,8 +222,8 @@ class BlockPool:
             block = self._cached.get(digest)
             if block is None:
                 break
-            self._cached.move_to_end(digest)
-            self._refcount[block] = self._refcount.get(block, 0) + 1
+            self._touch(digest)
+            self._ref(block)
             acquired.append(block)
         self._notify_changed()
         return acquired
@@ -224,16 +241,24 @@ class BlockPool:
         added: List[Tuple[int, bytes]] = []
         for index, (digest, block) in enumerate(zip(hashes, blocks)):
             if digest in self._cached:
-                self._cached.move_to_end(digest)
+                self._touch(digest)
                 continue
             # A block can only carry one prefix; re-keying it would strand the
             # old digest pointing at content that is no longer there.
             previous = self._block_to_digest.get(block)
             if previous is not None and previous != digest:
                 continue
+            parent = hashes[index - 1] if index else None
             self._cached[digest] = block
             self._block_to_digest[block] = digest
-            self._parents[digest] = hashes[index - 1] if index else None
+            self._parents[digest] = parent
+            if parent is not None:
+                self._children[parent] = self._children.get(parent, 0) + 1
+            self._tick += 1
+            self._ticks[digest] = self._tick
+            if self._refcount.get(block, 0) == 0:
+                self._evictable += 1
+                self._push_leaf(digest)
             added.append((index, digest))
         self._notify_changed()
         return added
@@ -248,29 +273,78 @@ class BlockPool:
     # -- internals ---------------------------------------------------------
 
     def _evictable_count(self) -> int:
-        return sum(1 for b in self._cached.values() if self._refcount.get(b, 0) == 0)
+        return self._evictable
 
     def _evict_one(self, collect: Optional[List[int]] = None, *, clearing: bool = False) -> bool:
         """Evict an LRU leaf so no reusable child outlives its published parent."""
-        non_leaves = set(self._parents.values())
-        for digest, block in self._cached.items():
-            if self._refcount.get(block, 0) != 0 or digest in non_leaves:
+        while self._leaves:
+            tick, digest = heapq.heappop(self._leaves)
+            if self._ticks.get(digest) != tick or not self._is_evictable_leaf(digest):
                 continue
-            del self._cached[digest]
-            del self._parents[digest]
+            block = self._cached.pop(digest)
+            del self._ticks[digest]
+            parent = self._parents.pop(digest)
             self._block_to_digest.pop(block, None)
+            self._evictable -= 1
+            if parent is not None:
+                remaining = self._children[parent] - 1
+                if remaining:
+                    self._children[parent] = remaining
+                else:
+                    del self._children[parent]
+                    self._push_leaf(parent)
             if clearing:
                 self.cleared_blocks += 1
             else:
                 self.evicted_blocks += 1
-            if block not in self._free_clean:
-                self._free_clean.append(block)
+            self._add_clean(block)
             if collect is None:
                 self._notify_evicted([external_id(digest)])
             else:
                 collect.append(external_id(digest))
             return True
         return False
+
+    def _is_evictable_leaf(self, digest: bytes) -> bool:
+        block = self._cached.get(digest)
+        return (
+            block is not None
+            and self._refcount.get(block, 0) == 0
+            and digest not in self._children
+        )
+
+    def _push_leaf(self, digest: bytes) -> None:
+        if not self._is_evictable_leaf(digest):
+            return
+        heapq.heappush(self._leaves, (self._ticks[digest], digest))
+        if len(self._leaves) > 2 * len(self._cached) + 64:
+            self._leaves = [
+                (tick, d) for d, tick in self._ticks.items() if self._is_evictable_leaf(d)
+            ]
+            heapq.heapify(self._leaves)
+
+    def _touch(self, digest: bytes) -> None:
+        self._cached.move_to_end(digest)
+        self._tick += 1
+        self._ticks[digest] = self._tick
+        self._push_leaf(digest)
+
+    def _ref(self, block: int) -> None:
+        count = self._refcount.get(block, 0)
+        self._refcount[block] = count + 1
+        if count == 0 and block in self._block_to_digest:
+            self._evictable -= 1
+
+    def _unreferenced(self, block: int) -> None:
+        digest = self._block_to_digest.get(block)
+        if digest is not None:
+            self._evictable += 1
+            self._push_leaf(digest)
+
+    def _add_clean(self, block: int) -> None:
+        if block not in self._free_clean_set:
+            self._free_clean_set.add(block)
+            self._free_clean.append(block)
 
     def _notify_evicted(self, ids: List[int]) -> None:
         self._notify_changed()
