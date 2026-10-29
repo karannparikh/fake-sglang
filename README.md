@@ -261,15 +261,19 @@ level, such as `region-a/cluster-1`, so a cluster name reused in another
 region is still a different cluster. The launcher also sets the
 `DYN_TOPOLOGY_*` and `DYN_KV_TRANSFER_*` variables that Dynamo's SGLang
 worker reads at registration. Aggregated workers are left alone because they
-never transfer KV.
+never transfer KV. Copies of these variables exported by your shell are not
+passed to any process, so the YAML alone decides the policy.
 
 - **`required`**: only decode workers in the prefill worker's domain are
   eligible. Dynamo picks the prefill worker without checking for decode
   capacity, so a prefill worker with no decode worker in its domain would fail
   every request it gets. The launcher rejects that layout before starting
   anything.
-- **`preferred`**: same-domain decode workers get a routing bonus scaled by
-  `preferred_weight` (0 to 1), but a busy domain can still spill across.
+- **`preferred`**: a mild bias. Dynamo multiplies a same-domain decode
+  worker's routing cost by `exp(-tanh(preferred_weight))`, so even the
+  maximum weight of 1 only scales it by about 0.47: a local worker still
+  loses to a remote one with less than half its load. The launcher accepts
+  weights above 0 and up to 1 (0 would have no effect).
 
 Only one level is enforced, as an exact match. There is no fallback from zone
 to cluster to region. With `required`, the plan printed at startup marks pairs

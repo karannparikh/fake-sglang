@@ -142,9 +142,10 @@ def _kv_transfer_policy(
         )
     weight = raw.get("preferred_weight")
     if enforcement == "preferred":
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= 1:
+        # 0 would make the preference a no-op (Dynamo's multiplier is exp(-tanh(w))).
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 < weight <= 1:
             raise ConfigError(
-                f"{where}.preferred_weight must be a number from 0 to 1 when "
+                f"{where}.preferred_weight must be a number above 0 and at most 1 when "
                 f"enforcement is preferred, got {weight!r}"
             )
         weight = float(weight)
@@ -435,6 +436,14 @@ def _pump(proc: Proc, color: Optional[str], width: int, log_file) -> None:
             log_file.flush()
 
 
+def child_env(base: Dict[str, str], shared_env: Dict[str, str],
+              proc_env: Dict[str, str]) -> Dict[str, str]:
+    """Environment for one child. Topology variables exported by the launching
+    shell are dropped, so only the YAML decides the KV transfer policy."""
+    env = {k: v for k, v in base.items() if k not in TOPOLOGY_ENV}
+    return {**env, **shared_env, **proc_env}
+
+
 def run(procs: List[Proc], log_dir: Optional[Path], shared_env: Dict[str, str]) -> int:
     use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     width = max(len(p.name) for p in procs)
@@ -452,7 +461,7 @@ def run(procs: List[Proc], log_dir: Optional[Path], shared_env: Dict[str, str]) 
     threads = []
     try:
         for i, proc in enumerate(procs):
-            env = {**os.environ, **shared_env, **proc.env}
+            env = child_env(os.environ, shared_env, proc.env)
             proc.popen = subprocess.Popen(
                 proc.argv,
                 env=env,

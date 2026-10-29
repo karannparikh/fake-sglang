@@ -281,6 +281,16 @@ def test_kv_transfer_preferred_allows_prefill_without_local_decode():
     assert procs[1].env["DYN_KV_TRANSFER_PREFERRED_WEIGHT"] == "1.0"
 
 
+def test_child_env_drops_inherited_topology_vars():
+    # A stray weight from the shell would make Dynamo reject a required policy.
+    shell = {"PATH": "/bin", "DYN_TOPOLOGY_ENABLED": "true",
+             "DYN_KV_TRANSFER_PREFERRED_WEIGHT": "0.5", "DYN_KV_TRANSFER_DOMAIN": "rack"}
+    policy = {"DYN_TOPOLOGY_ENABLED": "true", "DYN_KV_TRANSFER_DOMAIN": "zone"}
+    env = deployment.child_env(shell, {"DYN_FILE_KV": "/kv"}, policy)
+    assert env == {"PATH": "/bin", "DYN_FILE_KV": "/kv", **policy}
+    assert deployment.child_env(shell, {}, {}) == {"PATH": "/bin"}
+
+
 def test_without_kv_transfer_no_topology_env():
     config = _placed(None)
     del config["topology"]["kv_transfer"]
@@ -337,6 +347,8 @@ def test_shipped_zone_local_example_keeps_every_pair_in_one_zone():
         ({"domain": "region", "enforcement": "preferred"}, "kv", None, "preferred_weight"),
         ({"domain": "region", "enforcement": "preferred", "preferred_weight": 2}, "kv", None,
          "preferred_weight"),
+        ({"domain": "region", "enforcement": "preferred", "preferred_weight": 0}, "kv", None,
+         "above 0"),
         ({"domain": "region", "preferred_weight": 0.5}, "kv", None, "only applies to preferred"),
         ({"domain": "region", "weight": 0.5}, "kv", None, "unknown keys"),
         ("region", "kv", None, "must be a mapping"),
