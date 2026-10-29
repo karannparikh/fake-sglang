@@ -100,9 +100,10 @@ async def test_completion_is_not_delayed_and_blocks_stay_unavailable_until_relea
     request = await finish_prebuilt(scheduler, list(range(5)), 1)
     lease = request.retention_lease
 
-    assert request.queue.get_nowait() == ("token", 9001)
-    assert request.queue.get_nowait() == ("done", "length")
-    assert request.queue.empty()
+    token_ids, finish_reason = await request.next_output()
+    assert token_ids == [9001]
+    assert finish_reason == "length"
+    assert not request.output_notification_pending
     assert scheduler.stats()["kv_retention_active_leases"] == 1
     assert scheduler.stats()["kv_used_blocks"] == lease.block_count
 
@@ -155,8 +156,12 @@ async def test_scheduler_loop_expires_idle_lease_without_a_new_request(server_ar
             first_token=17,
             retain_response_kv=True,
         ))
-        assert await asyncio.wait_for(request.queue.get(), 1) == ("token", 17)
-        assert await asyncio.wait_for(request.queue.get(), 1) == ("done", "length")
+        token_ids, finish_reason = await asyncio.wait_for(
+            request.next_output(),
+            1,
+        )
+        assert token_ids == [17]
+        assert finish_reason == "length"
         lease = request.retention_lease
         await asyncio.sleep(0.05)
         assert lease.released
@@ -205,10 +210,10 @@ async def test_expiry_during_decode_sleep_releases_capacity_before_growth(
     assert lease.released
     assert lease.release_reason == "expired"
     assert contender.finished
-    events = [contender.queue.get_nowait() for _ in range(3)]
-    assert events[0] == ("token", 23)
-    assert events[1][0] == "token"
-    assert events[2] == ("done", "length")
+    token_ids, finish_reason = await contender.next_output()
+    assert token_ids[0] == 23
+    assert len(token_ids) == 2
+    assert finish_reason == "length"
     assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
 
 
@@ -250,9 +255,9 @@ async def test_budget_rejection_preserves_successful_response(
 
     assert request.retention_lease is None
     assert request.retention_rejection_reason == expected_reason
-    events = [request.queue.get_nowait() for _ in range(6)]
-    assert [kind for kind, _payload in events] == ["token"] * 5 + ["done"]
-    assert events[-1] == ("done", "length")
+    token_ids, finish_reason = await request.next_output()
+    assert len(token_ids) == 5
+    assert finish_reason == "length"
     assert scheduler.stats()["kv_retention_rejections"] == 1
     assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
 
@@ -268,8 +273,9 @@ async def test_lease_count_budget_declines_only_the_optimization(server_args):
     assert first.retention_lease is not None
     assert second.retention_lease is None
     assert second.retention_rejection_reason == "lease_budget"
-    assert second.queue.get_nowait()[0] == "token"
-    assert second.queue.get_nowait() == ("done", "length")
+    token_ids, finish_reason = await second.next_output()
+    assert len(token_ids) == 1
+    assert finish_reason == "length"
     scheduler.abort_all()
     assert first.retention_lease.released
     assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
@@ -382,7 +388,14 @@ async def test_decode_stream_close_before_terminal_delivery_releases_lease(
     try:
         first = await asyncio.wait_for(anext(stream), 1)
         assert first["meta_info"]["finish_reason"] is None
-        lease = engine.scheduler.get_retention_lease("closed-before-terminal")
+        lease = None
+        for _ in range(100):
+            lease = engine.scheduler.get_retention_lease(
+                "closed-before-terminal"
+            )
+            if lease is not None:
+                break
+            await asyncio.sleep(0.01)
         assert lease is not None
         assert not lease.released
 
