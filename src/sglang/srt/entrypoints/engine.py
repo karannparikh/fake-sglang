@@ -552,30 +552,21 @@ class Engine:
             scheduler.abort(request_id)
 
     async def _drain(self, request: Request, started: float) -> AsyncIterator[dict]:
-        """Turn scheduler events into SGLang response chunks.
-
-        One token is held back so the terminal chunk can carry both the last
-        token and the finish reason, the way SGLang's streaming does.
-        """
+        """Turn separated per-request outputs into SGLang response chunks."""
         completion = 0
-        pending: Optional[int] = None
 
         while True:
-            kind, payload = await request.queue.get()
-            if kind == "token":
-                if pending is not None:
-                    completion += 1
-                    yield self._chunk(request, [pending], completion, None, started)
-                pending = payload
-                continue
-
-            # kind == "done"
-            tokens: List[int] = []
-            if pending is not None:
-                tokens.append(pending)
-                completion += 1
-            yield self._chunk(request, tokens, completion, payload, started)
-            return
+            token_ids, finish_reason = await request.next_output()
+            completion += len(token_ids)
+            yield self._chunk(
+                request,
+                token_ids,
+                completion,
+                finish_reason,
+                started,
+            )
+            if finish_reason is not None:
+                return
 
     def _chunk(
         self,

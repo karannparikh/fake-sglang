@@ -29,6 +29,7 @@ class SimConfig:
     num_kv_blocks: int
     max_running_requests: int
     max_batched_tokens: int
+    stream_interval: int
 
     prefill_ms_per_1k: float
     prefill_overhead_ms: float
@@ -187,6 +188,10 @@ class SimConfig:
             num_kv_blocks=num_blocks,
             max_running_requests=max_running // dp_size if max_running is not None else 32,
             max_batched_tokens=max_batched,
+            stream_interval=_positive_int(
+                server_args.stream_interval,
+                "stream_interval",
+            ),
             prefill_ms_per_1k=float(server_args.fake_prefill_ms_per_1k_tokens),
             prefill_overhead_ms=float(server_args.fake_prefill_overhead_ms),
             kv_generation_ms_per_1k=kv_generation_ms,

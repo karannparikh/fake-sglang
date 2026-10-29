@@ -8,6 +8,7 @@ Models the parts of an LLM scheduler that change observable behavior:
   as ITL growth the way it does on a GPU;
 * a finite KV pool with LIFO preemption, so memory pressure is reachable;
 * prefix reuse, so a repeated prompt reports non-zero ``cached_tokens``.
+* scheduler-wide output batches separated into coalesced request streams.
 
 "Prebuilt" requests are the decode side of disaggregation: their KV already
 arrived over the (simulated) transfer, so they skip prefill compute but still
@@ -62,10 +63,11 @@ class PrefixImportReservation:
 
 class Request:
     __slots__ = (
-        "rid", "prompt_ids", "max_new_tokens", "prebuilt", "first_token",
-        "queue", "blocks", "prefilled", "generated", "cached_tokens",
-        "_stream", "_hashes", "finished", "arrival", "cache_salt",
-        "_cache_observed", "observe_cache",
+        "_cache_observed", "_hashes", "_output_event", "_output_ready",
+        "_output_reason", "_output_tokens", "_stream", "arrival", "blocks",
+        "cache_salt", "cached_tokens", "finished", "first_token", "generated",
+        "max_new_tokens", "observe_cache", "prebuilt", "prefilled", "prompt_ids",
+        "rid",
     )
 
     def __init__(
@@ -86,7 +88,6 @@ class Request:
         self.max_new_tokens = max(int(max_new_tokens), 1)
         self.prebuilt = prebuilt
         self.first_token = first_token
-        self.queue: asyncio.Queue = asyncio.Queue()
         self.blocks: List[int] = []
         self.prefilled = 0
         self.generated: List[int] = []
@@ -97,10 +98,77 @@ class Request:
         self.arrival = time.monotonic()
         self._cache_observed = False
         self.observe_cache = observe_cache
+        self._output_tokens: list[int] = []
+        self._output_ready = 0
+        self._output_reason: str | None = None
+        self._output_event = asyncio.Event()
 
     @property
     def total_tokens(self) -> int:
         return len(self.prompt_ids) + len(self.generated)
+
+    @property
+    def pending_output_tokens(self) -> int:
+        return len(self._output_tokens)
+
+    @property
+    def output_notification_pending(self) -> bool:
+        return self._output_event.is_set()
+
+    @property
+    def output_finished(self) -> bool:
+        return self._output_reason is not None
+
+    def publish_output(
+        self,
+        token_ids: Sequence[int],
+        finish_reason: str | None,
+        stream_interval: int,
+    ) -> None:
+        """Add separated output without allocating one queue item per token."""
+        self._output_tokens.extend(token_ids)
+        unsent = len(self._output_tokens) - self._output_ready
+        if finish_reason is not None:
+            self._output_ready = len(self._output_tokens)
+            self._output_reason = finish_reason
+        elif unsent >= stream_interval:
+            self._output_ready += unsent // stream_interval * stream_interval
+        else:
+            return
+        self._output_event.set()
+
+    async def next_output(self) -> tuple[list[int], str | None]:
+        """Wait for the next stream-interval boundary or terminal flush."""
+        while True:
+            if self._output_ready:
+                token_ids = self._output_tokens[:self._output_ready]
+                del self._output_tokens[:self._output_ready]
+                self._output_ready = 0
+                finish_reason = None
+                if self._output_reason is not None and not self._output_tokens:
+                    finish_reason = self._output_reason
+                    self._output_reason = None
+                self._output_event.clear()
+                return token_ids, finish_reason
+            if self._output_reason is not None:
+                finish_reason = self._output_reason
+                self._output_reason = None
+                self._output_event.clear()
+                return [], finish_reason
+            self._output_event.clear()
+            await self._output_event.wait()
+
+
+@dataclass(frozen=True)
+class RequestOutput:
+    request: Request
+    token_ids: tuple[int, ...] = ()
+    finish_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SchedulerOutputBatch:
+    outputs: tuple[RequestOutput, ...]
 
 
 class Scheduler:
@@ -128,6 +196,8 @@ class Scheduler:
         self.by_rid: Dict[str, Request] = {}
         self._wakeup = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._output_queue: asyncio.Queue[SchedulerOutputBatch] = asyncio.Queue()
+        self._output_task: asyncio.Task | None = None
         self._stopping = False
         self.last_step_ms = 0.0
         self.fpm = fpm
@@ -141,7 +211,9 @@ class Scheduler:
 
     def start(self) -> None:
         if self._task is None:
-            self._task = asyncio.get_running_loop().create_task(self._run())
+            loop = asyncio.get_running_loop()
+            self._output_task = loop.create_task(self._run_output_processor())
+            self._task = loop.create_task(self._run())
 
     async def stop(self) -> None:
         self._stopping = True
@@ -157,6 +229,14 @@ class Scheduler:
             self._task = None
             for rid in list(self.by_rid):
                 self.abort(rid)
+            if self._output_task is not None:
+                await self._output_queue.join()
+                self._output_task.cancel()
+                try:
+                    await self._output_task
+                except asyncio.CancelledError:
+                    pass
+                self._output_task = None
             if self.fpm is not None:
                 self.fpm.close()
                 self.fpm = None
@@ -372,6 +452,31 @@ class Scheduler:
             self._publish_idle_fpm()
             await asyncio.sleep(0.001)
 
+    async def _run_output_processor(self) -> None:
+        while True:
+            batch = await self._output_queue.get()
+            try:
+                self._separate_outputs(batch)
+            finally:
+                self._output_queue.task_done()
+
+    def _publish_output_batch(self, outputs: Sequence[RequestOutput]) -> None:
+        if not outputs:
+            return
+        batch = SchedulerOutputBatch(tuple(outputs))
+        if self._output_task is None or self._output_task.done():
+            self._separate_outputs(batch)
+        else:
+            self._output_queue.put_nowait(batch)
+
+    def _separate_outputs(self, batch: SchedulerOutputBatch) -> None:
+        for output in batch.outputs:
+            output.request.publish_output(
+                output.token_ids,
+                output.finish_reason,
+                self.config.stream_interval,
+            )
+
     async def _prefill_step(self) -> bool:
         """Advance prefill for as many waiting requests as the budget allows.
 
@@ -455,12 +560,14 @@ class Scheduler:
             scheduled_ids,
         )
 
+        outputs: list[RequestOutput] = []
         for request in admitted:
             if request.finished:
                 continue
             self._cache_prefix(request)
             self.running.append(request)
-            self._emit_first_token(request)
+            outputs.append(self._emit_first_token(request))
+        self._publish_output_batch(outputs)
         return True
 
     async def _decode_step(self) -> None:
@@ -477,25 +584,33 @@ class Scheduler:
             {r.rid for r in self.running},
         )
 
+        outputs: list[RequestOutput] = []
         for request in list(self.running):
             if request.finished:
                 continue
             if not self._grow_blocks(request, request.total_tokens + 1):
                 if not self._preempt_one(protect=request):
-                    self._finish(request, FINISH_ABORT)
+                    self._complete(request)
+                    outputs.append(RequestOutput(request, finish_reason=FINISH_ABORT))
                     continue
                 if not self._grow_blocks(request, request.total_tokens + 1):
-                    self._finish(request, FINISH_ABORT)
+                    self._complete(request)
+                    outputs.append(RequestOutput(request, finish_reason=FINISH_ABORT))
                     continue
 
             token = self._next_token(request)
             request.generated.append(token)
-            request.queue.put_nowait(("token", token))
 
-            if len(request.generated) >= request.max_new_tokens:
-                self._finish(request, FINISH_LENGTH)
-            elif request.total_tokens >= self.config.context_len:
-                self._finish(request, FINISH_LENGTH)
+            finish_reason = None
+            if (
+                len(request.generated) >= request.max_new_tokens
+                or request.total_tokens >= self.config.context_len
+            ):
+                finish_reason = FINISH_LENGTH
+            if finish_reason is not None:
+                self._complete(request)
+            outputs.append(RequestOutput(request, (token,), finish_reason))
+        self._publish_output_batch(outputs)
 
     async def _sleep_step(
         self, milliseconds: float, scheduled: ScheduledRequestMetrics, scheduled_ids: set,
@@ -571,7 +686,7 @@ class Scheduler:
                 cache_salt=request.cache_salt,
             )
 
-    def _emit_first_token(self, request: Request) -> None:
+    def _emit_first_token(self, request: Request) -> RequestOutput:
         # Always draw, even when the caller supplied the token: a disaggregated
         # decode inherits prefill's first token, and the stream must still
         # advance past position 0 so the rest of the answer continues where
@@ -579,9 +694,11 @@ class Scheduler:
         drawn = self._next_token(request)
         token = request.first_token if request.first_token is not None else drawn
         request.generated.append(token)
-        request.queue.put_nowait(("token", token))
+        finish_reason = None
         if len(request.generated) >= request.max_new_tokens:
-            self._finish(request, FINISH_LENGTH)
+            finish_reason = FINISH_LENGTH
+            self._complete(request)
+        return RequestOutput(request, (token,), finish_reason)
 
     def _next_token(self, request: Request) -> int:
         if request._stream is None:                       # noqa: SLF001
@@ -615,8 +732,13 @@ class Scheduler:
         return False
 
     def _finish(self, request: Request, reason: str) -> None:
-        if request.finished:
+        if not self._complete(request):
             return
+        self._publish_output_batch((RequestOutput(request, finish_reason=reason),))
+
+    def _complete(self, request: Request) -> bool:
+        if request.finished:
+            return False
         request.finished = True
         if request in self.running:
             self.running.remove(request)
@@ -625,4 +747,4 @@ class Scheduler:
         self.pool.free(request.blocks)
         request.blocks = []
         self.by_rid.pop(request.rid, None)
-        request.queue.put_nowait(("done", reason))
+        return True

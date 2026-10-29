@@ -38,6 +38,10 @@ SGLang and never knows the difference.
   routes on cache hits.
 - **Scheduler metrics** — pushed over ZMQ to the socket Dynamo binds, so
   load-based routing sees real occupancy.
+- **Batched streaming output** — each scheduler step publishes one shared
+  output batch that is separated into independent request streams.
+  `--stream-interval` controls per-request emission, and completion flushes
+  any unsent tail with the finish reason.
 - **Forward-pass metrics (FPM)** — simulated scheduled/queued token counts,
   batch sizes, variances and pass durations, relayed through real Dynamo.
   Idle heartbeats clear stale load so the Planner can scale down.
