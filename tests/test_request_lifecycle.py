@@ -61,8 +61,9 @@ async def test_abort_during_prefill_does_not_resurrect_request(server_args):
         assert scheduler.running == []
         assert scheduler.by_rid == {}
         assert request.generated == []
-        assert request.queue.get_nowait() == ("done", "abort")
-        assert request.queue.empty()
+        assert await request.next_output() == ([], "abort")
+        assert request.pending_output_tokens == 0
+        assert not request.output_notification_pending
         assert scheduler.pool.cached_blocks == 0
     finally:
         resume.set()
