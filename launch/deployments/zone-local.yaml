@@ -20,7 +20,7 @@ topology:
     zone:    {bandwidth_gb_s: 50,    latency_ms: 0.05}      # within a zone
     default: {bandwidth_gb_s: 0.001, latency_ms: 1000000}   # across zones: ~17 min, never worth it
   # required: decode must be in the prefill worker's zone.
-  # preferred: same-zone decode is favoured; add preferred_weight (0 to 1).
+  # preferred: same-zone decode is favoured; use 0 < preferred_weight <= 1.
   kv_transfer: {domain: zone, enforcement: required}
 
 workers:
