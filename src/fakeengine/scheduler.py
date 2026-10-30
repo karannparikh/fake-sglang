@@ -22,6 +22,7 @@ import asyncio
 import logging
 import math
 import time
+from dataclasses import dataclass
 from statistics import pvariance
 from typing import Dict, List, Optional, Sequence
 

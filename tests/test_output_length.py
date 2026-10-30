@@ -24,11 +24,10 @@ async def _run(scheduler: Scheduler, request: Request) -> tuple:
     scheduler.submit(request)
     tokens = []
     while True:
-        kind, payload = await request.queue.get()
-        if kind == "token":
-            tokens.append(payload)
-        else:
-            return tokens, payload
+        output_ids, finish_reason = await request.next_output()
+        tokens.extend(output_ids)
+        if finish_reason is not None:
+            return tokens, finish_reason
 
 
 async def _collect(stream) -> tuple:
