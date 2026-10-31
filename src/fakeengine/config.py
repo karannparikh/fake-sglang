@@ -21,6 +21,7 @@ class SimConfig:
     model_path: str
     served_model_name: str
     disaggregation_mode: str        # null | prefill | decode
+    timing_profile: str             # aggregated | disaggregated
     vocab_size: int
     context_len: int
     kv_bytes_per_token: int
@@ -111,6 +112,53 @@ class SimConfig:
             or 8192
         )
 
+        disaggregation_mode = server_args.disaggregation_mode or "null"
+        timing_profile = server_args.fake_timing_profile
+        if timing_profile not in {"auto", "aggregated", "disaggregated"}:
+            raise ValueError(
+                "fake_timing_profile must be auto, aggregated, or disaggregated"
+            )
+        if timing_profile == "auto":
+            timing_profile = (
+                "aggregated"
+                if disaggregation_mode == "null"
+                else "disaggregated"
+            )
+        timing_defaults = {
+            "aggregated": {
+                "prefill_ms_per_1k": 55.0,
+                "prefill_overhead_ms": 4.0,
+                "itl_ms": 9.0,
+                "itl_ms_per_running_req": 0.35,
+            },
+            "disaggregated": {
+                "prefill_ms_per_1k": 55.0,
+                "prefill_overhead_ms": 320.0,
+                "itl_ms": 3.6,
+                "itl_ms_per_running_req": 0.0,
+            },
+        }[timing_profile]
+        prefill_ms_per_1k = _timing_value(
+            server_args.fake_prefill_ms_per_1k_tokens,
+            timing_defaults["prefill_ms_per_1k"],
+            "fake_prefill_ms_per_1k_tokens",
+        )
+        prefill_overhead_ms = _timing_value(
+            server_args.fake_prefill_overhead_ms,
+            timing_defaults["prefill_overhead_ms"],
+            "fake_prefill_overhead_ms",
+        )
+        itl_ms = _timing_value(
+            server_args.fake_itl_ms,
+            timing_defaults["itl_ms"],
+            "fake_itl_ms",
+        )
+        itl_ms_per_running_req = _timing_value(
+            server_args.fake_itl_ms_per_running_req,
+            timing_defaults["itl_ms_per_running_req"],
+            "fake_itl_ms_per_running_req",
+        )
+
         location = getattr(server_args, "fake_location", None) or None
         topology = load_topology(getattr(server_args, "fake_topology", None))
         if topology is not None and location is not None:
@@ -133,7 +181,6 @@ class SimConfig:
         )
 
         enable_kv_return = bool(getattr(server_args, "enable_kv_return", False))
-        disaggregation_mode = server_args.disaggregation_mode or "null"
         prefix_caching = not bool(getattr(server_args, "disable_radix_cache", False))
         # Mirror ``KVSender._return_ticket``: the reverse path only produces a
         # ticket on prefill workers with radix caching enabled. Any other
@@ -233,6 +280,7 @@ class SimConfig:
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
             disaggregation_mode=disaggregation_mode,
+            timing_profile=timing_profile,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
             kv_bytes_per_token=kv_bytes_per_token,
@@ -244,11 +292,11 @@ class SimConfig:
                 server_args.stream_interval,
                 "stream_interval",
             ),
-            prefill_ms_per_1k=float(server_args.fake_prefill_ms_per_1k_tokens),
-            prefill_overhead_ms=float(server_args.fake_prefill_overhead_ms),
+            prefill_ms_per_1k=prefill_ms_per_1k,
+            prefill_overhead_ms=prefill_overhead_ms,
             kv_generation_ms_per_1k=kv_generation_ms,
-            itl_ms=float(server_args.fake_itl_ms),
-            itl_ms_per_running_req=float(server_args.fake_itl_ms_per_running_req),
+            itl_ms=itl_ms,
+            itl_ms_per_running_req=itl_ms_per_running_req,
             kv_bandwidth_gb_s=kv_bandwidth_gb_s,
             kv_transfer_overhead_ms=kv_transfer_overhead_ms,
             enable_kv_return=enable_kv_return,
@@ -295,7 +343,7 @@ def announce(config: SimConfig) -> None:
         "fake-sglang: SIMULATED engine -- no model weights, no real inference. "
         "mode=%s model=%s vocab=%d kv=%d blocks x %d tok "
         "(%.1f KiB/token) prefill=%.1fms/1k kv-generation=%.1fms/1k "
-        "itl=%.1fms xfer=%s speedup=%.2fx "
+        "timing=%s itl=%.1fms xfer=%s speedup=%.2fx "
         "output-len=%s location=%s",
         config.disaggregation_mode,
         config.served_model_name,
@@ -305,6 +353,7 @@ def announce(config: SimConfig) -> None:
         config.kv_bytes_per_token / 1024,
         config.prefill_ms_per_1k,
         config.kv_generation_ms_per_1k,
+        config.timing_profile,
         config.itl_ms,
         "per-link topology"
         if config.topology is not None
@@ -346,3 +395,10 @@ def _nonnegative_finite_float(value: Any, name: str) -> float:
     if not math.isfinite(number) or number < 0:
         raise ValueError(f"{name} must be finite and nonnegative")
     return number
+
+
+def _timing_value(value: Any, default: float, name: str) -> float:
+    return _nonnegative_finite_float(
+        default if value is None else value,
+        name,
+    )

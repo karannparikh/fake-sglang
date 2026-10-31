@@ -54,6 +54,9 @@ class TimingModel:
         """
         cfg = self.config
         batch_size = max(int(running_requests), 1)
+        if cfg.timing_profile == "aggregated":
+            extra = (batch_size - 1) * cfg.itl_ms_per_running_req
+            return cfg.itl_ms + extra
         calibrated = _interpolate(_DISAGG_DECODE_ENGINE_P50_MS, batch_size)
         baseline_shift = cfg.itl_ms - _REFERENCE_ITL_MS
         extra = (batch_size - 1) * cfg.itl_ms_per_running_req

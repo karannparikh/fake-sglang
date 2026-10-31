@@ -107,14 +107,21 @@ def test_default_disaggregated_decode_profile_matches_engine_only_p50(
     batch_size,
     expected_ms,
 ):
-    timing = TimingModel(_config(server_args))
+    timing = TimingModel(_config(
+        server_args,
+        disaggregation_mode="decode",
+    ))
     assert timing.decode_step_ms(batch_size) == pytest.approx(expected_ms)
 
 
 def test_decode_profile_interpolates_and_honors_adjustments(server_args):
-    timing = TimingModel(_config(server_args))
+    timing = TimingModel(_config(
+        server_args,
+        disaggregation_mode="decode",
+    ))
     adjusted = TimingModel(_config(
         server_args,
+        disaggregation_mode="decode",
         fake_itl_ms=5.6,
         fake_itl_ms_per_running_req=0.1,
     ))
@@ -142,11 +149,43 @@ def test_default_disaggregated_prefill_fit_tracks_no_cache_p50(
     representative_tokens,
     expected_ms,
 ):
-    timing = TimingModel(_config(server_args))
+    timing = TimingModel(_config(
+        server_args,
+        disaggregation_mode="prefill",
+    ))
     assert timing.prefill_ms(representative_tokens) == pytest.approx(
         expected_ms,
         rel=0.18,
     )
+
+
+def test_auto_timing_profile_separates_aggregated_and_disaggregated(server_args):
+    aggregated = _config(server_args)
+    prefill = _config(server_args, disaggregation_mode="prefill")
+    decode = _config(server_args, disaggregation_mode="decode")
+
+    assert aggregated.timing_profile == "aggregated"
+    assert prefill.timing_profile == decode.timing_profile == "disaggregated"
+    assert TimingModel(aggregated).prefill_ms(1000) == pytest.approx(59.0)
+    assert TimingModel(prefill).prefill_ms(1000) == pytest.approx(375.0)
+    assert TimingModel(aggregated).decode_step_ms(32) == pytest.approx(19.85)
+    assert TimingModel(decode).decode_step_ms(32) == pytest.approx(10.4)
+
+
+def test_explicit_timing_profile_and_knobs_override_role_defaults(server_args):
+    timing = TimingModel(_config(
+        server_args,
+        disaggregation_mode="decode",
+        fake_timing_profile="aggregated",
+        fake_prefill_ms_per_1k_tokens=10,
+        fake_prefill_overhead_ms=2,
+        fake_itl_ms=4,
+        fake_itl_ms_per_running_req=0.5,
+    ))
+
+    assert timing.config.timing_profile == "aggregated"
+    assert timing.prefill_ms(2000) == pytest.approx(22)
+    assert timing.decode_step_ms(4) == pytest.approx(5.5)
 
 
 def test_decode_step_degrades_with_batch_size(server_args):

@@ -307,11 +307,12 @@ instead of adding the aggregated workers to the decode pool.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--fake-prefill-ms-per-1k-tokens` | 55.0 | Prefill cost per 1k recomputed tokens |
-| `--fake-prefill-overhead-ms` | 320.0 | Fixed per-prefill-step cost |
+| `--fake-timing-profile` | `auto` | Select `aggregated` for combined workers and `disaggregated` for prefill/decode roles; either profile may be forced |
+| `--fake-prefill-ms-per-1k-tokens` | profile default | Override prefill cost per 1k recomputed tokens |
+| `--fake-prefill-overhead-ms` | profile default | Override fixed per-prefill-step cost |
 | `--fake-kv-generation-ms-per-1k-tokens` | 0.0 | Additional K/V-generation cost for uncached prefill tokens |
-| `--fake-itl-ms` | 3.6 | Batch-one ITL; shifts the calibrated decode curve |
-| `--fake-itl-ms-per-running-req` | 0.0 | Optional linear ITL adjustment per extra request |
+| `--fake-itl-ms` | profile default | Override batch-one ITL |
+| `--fake-itl-ms-per-running-req` | profile default | Override linear ITL adjustment per extra request |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
 | `--enable-kv-return` | false | Enable version-1 best-effort response-KV return on eligible prefill and decode workers |
@@ -337,7 +338,12 @@ The timing defaults are calibrated from production observations of a
 interpreted as P50 / P90 / P95 / P99. Decode values are milliseconds; prefill
 values are seconds. Aggregated workers currently reuse these defaults unless
 their fake timing flags are overridden; these tables do not claim aggregated
-worker calibration.
+worker calibration. In `auto` mode, aggregated workers retain the original
+analytic defaults: `4 ms + 55 ms/1K` for prefill and
+`9 ms + 0.35 ms * (batch_size - 1)` for decode. Disaggregated prefill/decode
+roles use the calibrated defaults below. Explicit fake timing flags override
+the selected profile, and `--fake-timing-profile` can force either profile for
+controlled comparisons.
 
 | Disaggregated decode batch | Decode engine only | Including prefill-worker interruptions |
 |---:|---:|---:|
