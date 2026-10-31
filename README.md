@@ -119,6 +119,12 @@ on every rank. Abort and cache-flush controls cover all ranks.
 
 ## Setup
 
+To reproduce our Apple Silicon Kubernetes simulation lab, see the
+[Kubernetes lab runbook](docs/local-lab.md). It documents the Colima/kind
+setup, pinned engine and lab-tooling sources, configuration, observability,
+and current clean-build prerequisites. The lab tooling lives on a separate
+source branch; this documentation PR does not add it to `main`.
+
 Clone this repo next to a Dynamo checkout — the bootstrap script expects
 `../dynamo` and creates the shared virtualenv at `../.venv`:
 
