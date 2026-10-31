@@ -467,7 +467,10 @@ async def test_packed_disaggregation_preserves_topology_and_rank_selection(
             assert last[-1]["meta_info"]["cached_tokens"] == 16
             assert metadata[-1]["link"] == "default"
             assert metadata[-1]["transfer_ms"] > 5
-            assert metadata[-1]["kv_return"]["prefill_dp_rank"] == rank
+            assert (
+                metadata[-1]["kv_return"]["compatibility"]["prefill_dp_rank"]
+                == rank
+            )
             decode_engine.schedulers[rank].submit.assert_called_once()
             assert decode_engine.schedulers[rank].submit.call_args.args[0].prebuilt
             if rank == 0:
