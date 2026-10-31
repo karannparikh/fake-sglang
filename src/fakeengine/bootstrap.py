@@ -16,7 +16,8 @@ engine dependency-light.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from enum import Enum
 import json
 import logging
 import math
@@ -43,6 +44,46 @@ from fakeengine.kv_return import (
 logger = logging.getLogger(__name__)
 
 _KV_RETURN_MAX_BODY_BYTES = 1 << 20
+_KV_RETURN_MAX_RESPONSE_BYTES = 1 << 16
+
+
+class KVReturnClientError(RuntimeError):
+    """Base class for reverse-return client failures."""
+
+
+class KVReturnTransportError(KVReturnClientError):
+    """The reverse-return peer could not be reached."""
+
+
+class KVReturnProtocolError(KVReturnClientError):
+    """The peer or room metadata violated the reverse-return protocol."""
+
+
+class KVReturnControlStatus(str, Enum):
+    READY = "ready"
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+    DISABLED = "disabled"
+    EXPIRED = "expired"
+    CAPACITY_REJECTED = "capacity_rejected"
+    INCOMPATIBLE = "incompatible"
+    INVALID_TOKEN_IDS = "invalid_token_ids"
+    CHECKSUM_MISMATCH = "checksum_mismatch"
+    NOT_PREPARED = "not_prepared"
+    IMPORT_FAILED = "import_failed"
+    NOT_FOUND = "not_found"
+    INVALID_REQUEST = "invalid_request"
+
+
+@dataclass(frozen=True)
+class KVReturnControlResponse:
+    operation: str
+    protocol_version: int
+    http_status: int
+    status: KVReturnControlStatus
+    reason: str
+    idempotent: bool
+    reserved_blocks: int
 
 
 class _ControlInputError(ValueError):
@@ -518,6 +559,16 @@ def _parse_ticket(value: Any) -> KVReturnTicket:
     )
 
 
+def parse_kv_return_ticket(value: Any) -> KVReturnTicket:
+    """Strictly parse the ticket embedded in forward room metadata."""
+    try:
+        return _parse_ticket(value)
+    except _ControlInputError as exc:
+        raise KVReturnProtocolError(
+            f"invalid kv_return ticket: {exc.reason}"
+        ) from exc
+
+
 def _parse_compatibility(value: Any) -> KVReturnCompatibility:
     payload = _object(
         value,
@@ -714,6 +765,10 @@ class BootstrapClient:
     """Runs in the decode worker. Polls a prefill peer for one room."""
 
     def __init__(self, poll_interval_s: float, timeout_s: float) -> None:
+        if not math.isfinite(poll_interval_s) or poll_interval_s < 0:
+            raise ValueError("poll_interval_s must be finite and nonnegative")
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and positive")
         self.poll_interval_s = poll_interval_s
         self.timeout_s = timeout_s
         self._session: Any = None
@@ -772,9 +827,298 @@ class BootstrapClient:
         except Exception as exc:  # noqa: BLE001 - cleanup must never fail a request
             logger.debug("fake-sglang: room %s release failed: %s", room, exc)
 
+    async def prepare_kv_return(
+        self,
+        host: str,
+        port: int,
+        prepare: KVReturnPrepare,
+        *,
+        deadline: Optional[float] = None,
+    ) -> KVReturnControlResponse:
+        payload = asdict(prepare)
+        try:
+            if _parse_prepare(payload) != prepare:
+                raise _ControlInputError("prepare_did_not_round_trip")
+        except _ControlInputError as exc:
+            raise KVReturnProtocolError(
+                f"invalid KV return prepare request: {exc.reason}"
+            ) from exc
+        return await self._post_kv_return(
+            host,
+            port,
+            "prepare",
+            prepare.ticket.compatibility.protocol_version,
+            payload,
+            deadline=deadline,
+        )
+
+    async def commit_kv_return(
+        self,
+        host: str,
+        port: int,
+        commit: KVReturnCommit,
+        *,
+        deadline: Optional[float] = None,
+    ) -> KVReturnControlResponse:
+        payload = {
+            "prepare": asdict(commit.prepare),
+            "generated_token_ids": list(commit.generated_token_ids),
+        }
+        try:
+            if _parse_commit(payload) != commit:
+                raise _ControlInputError("commit_did_not_round_trip")
+        except _ControlInputError as exc:
+            raise KVReturnProtocolError(
+                f"invalid KV return commit request: {exc.reason}"
+            ) from exc
+        return await self._post_kv_return(
+            host,
+            port,
+            "commit",
+            commit.prepare.ticket.compatibility.protocol_version,
+            payload,
+            deadline=deadline,
+        )
+
+    async def abort_kv_return(
+        self,
+        host: str,
+        port: int,
+        abort: KVReturnAbort,
+        *,
+        deadline: Optional[float] = None,
+    ) -> KVReturnControlResponse:
+        payload = asdict(abort)
+        try:
+            if _parse_abort(payload) != abort:
+                raise _ControlInputError("abort_did_not_round_trip")
+        except _ControlInputError as exc:
+            raise KVReturnProtocolError(
+                f"invalid KV return abort request: {exc.reason}"
+            ) from exc
+        return await self._post_kv_return(
+            host,
+            port,
+            "abort",
+            abort.ticket.compatibility.protocol_version,
+            payload,
+            deadline=deadline,
+        )
+
+    async def _post_kv_return(
+        self,
+        host: str,
+        port: int,
+        operation: str,
+        protocol_version: int,
+        payload: Mapping[str, Any],
+        *,
+        deadline: Optional[float],
+    ) -> KVReturnControlResponse:
+        import aiohttp
+
+        _validate_peer(host, port)
+        if (
+            isinstance(protocol_version, bool)
+            or not isinstance(protocol_version, int)
+            or not 0 <= protocol_version <= KV_RETURN_MAX_INTEGER
+        ):
+            raise KVReturnProtocolError(
+                "KV return protocol version must be a nonnegative bounded integer"
+            )
+        request_deadline = (
+            time.monotonic() + self.timeout_s
+            if deadline is None
+            else deadline
+        )
+        remaining = request_deadline - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise TimeoutError(
+                f"KV return {operation} deadline expired before the request"
+            )
+
+        session = await self._get_session()
+        url = (
+            f"http://{_bracket(host)}:{port}"
+            f"/kv-return/v{protocol_version}/{operation}"
+        )
+
+        async def exchange() -> Tuple[int, str, bytes]:
+            async with session.post(url, json=payload) as response:
+                if (
+                    response.content_length is not None
+                    and response.content_length > _KV_RETURN_MAX_RESPONSE_BYTES
+                ):
+                    raise KVReturnProtocolError(
+                        f"KV return {operation} response is too large"
+                    )
+                raw = await response.content.read(
+                    _KV_RETURN_MAX_RESPONSE_BYTES + 1
+                )
+                if len(raw) > _KV_RETURN_MAX_RESPONSE_BYTES:
+                    raise KVReturnProtocolError(
+                        f"KV return {operation} response is too large"
+                    )
+                return response.status, response.content_type, raw
+
+        try:
+            http_status, content_type, raw = await asyncio.wait_for(
+                exchange(),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"timed out during KV return {operation}"
+            ) from exc
+        except KVReturnProtocolError:
+            raise
+        except aiohttp.ClientError as exc:
+            raise KVReturnTransportError(
+                f"KV return {operation} request to {host}:{port} failed: {exc}"
+            ) from exc
+
+        return _parse_kv_return_response(
+            operation,
+            protocol_version,
+            http_status,
+            content_type,
+            raw,
+        )
+
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()
+
+
+_KV_RETURN_HTTP_STATUSES = {
+    KVReturnControlStatus.READY: {200},
+    KVReturnControlStatus.COMMITTED: {200},
+    KVReturnControlStatus.ABORTED: {200},
+    KVReturnControlStatus.DISABLED: {403},
+    KVReturnControlStatus.EXPIRED: {410},
+    KVReturnControlStatus.CAPACITY_REJECTED: {409},
+    KVReturnControlStatus.INCOMPATIBLE: {409},
+    KVReturnControlStatus.INVALID_TOKEN_IDS: {422},
+    KVReturnControlStatus.CHECKSUM_MISMATCH: {422},
+    KVReturnControlStatus.NOT_PREPARED: {409},
+    KVReturnControlStatus.IMPORT_FAILED: {409},
+    KVReturnControlStatus.NOT_FOUND: {404},
+    KVReturnControlStatus.INVALID_REQUEST: {400, 413},
+}
+
+_KV_RETURN_FIXED_REASONS = {
+    KVReturnControlStatus.READY: "reservation_ready",
+    KVReturnControlStatus.COMMITTED: "prefix_committed",
+    KVReturnControlStatus.ABORTED: "attempt_aborted",
+    KVReturnControlStatus.DISABLED: "kv_return_disabled",
+    KVReturnControlStatus.EXPIRED: "attempt_expired",
+    KVReturnControlStatus.CAPACITY_REJECTED: "insufficient_clean_capacity",
+    KVReturnControlStatus.INVALID_TOKEN_IDS: "invalid_generated_token_ids",
+    KVReturnControlStatus.CHECKSUM_MISMATCH: "token_ids_checksum_mismatch",
+    KVReturnControlStatus.NOT_PREPARED: "attempt_not_prepared",
+    KVReturnControlStatus.IMPORT_FAILED: "atomic_prefix_import_failed",
+    KVReturnControlStatus.NOT_FOUND: "ticket_not_found",
+}
+
+_KV_RETURN_INCOMPATIBLE_REASONS = {
+    "incompatible_control_contract",
+    "prefill_dp_rank_mismatch",
+    "prefill_dp_rank_not_hosted",
+    "unsupported_protocol_version",
+}
+
+
+def _parse_kv_return_response(
+    operation: str,
+    protocol_version: int,
+    http_status: int,
+    content_type: str,
+    raw: bytes,
+) -> KVReturnControlResponse:
+    if content_type != "application/json":
+        raise KVReturnProtocolError(
+            f"KV return {operation} response must be application/json"
+        )
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError, OverflowError, RecursionError) as exc:
+        raise KVReturnProtocolError(
+            f"KV return {operation} response is not valid JSON"
+        ) from exc
+    expected_fields = {"status", "reason", "idempotent", "reserved_blocks"}
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise KVReturnProtocolError(
+            f"KV return {operation} response has the wrong fields"
+        )
+    try:
+        status = KVReturnControlStatus(payload["status"])
+    except (TypeError, ValueError) as exc:
+        raise KVReturnProtocolError(
+            f"KV return {operation} response has an unknown status"
+        ) from exc
+    if http_status not in _KV_RETURN_HTTP_STATUSES[status]:
+        raise KVReturnProtocolError(
+            f"KV return {operation} response status disagrees with HTTP status"
+        )
+    reason = payload["reason"]
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > KV_RETURN_MAX_METADATA_LENGTH
+    ):
+        raise KVReturnProtocolError(
+            f"KV return {operation} response reason has the wrong type"
+        )
+    fixed_reason = _KV_RETURN_FIXED_REASONS.get(status)
+    if fixed_reason is not None and reason != fixed_reason:
+        raise KVReturnProtocolError(
+            f"KV return {operation} response has an invalid reason"
+        )
+    if (
+        status == KVReturnControlStatus.INCOMPATIBLE
+        and reason not in _KV_RETURN_INCOMPATIBLE_REASONS
+    ):
+        raise KVReturnProtocolError(
+            f"KV return {operation} response has an invalid reason"
+        )
+    idempotent = payload["idempotent"]
+    reserved_blocks = payload["reserved_blocks"]
+    if not isinstance(idempotent, bool):
+        raise KVReturnProtocolError(
+            f"KV return {operation} response idempotent has the wrong type"
+        )
+    if (
+        isinstance(reserved_blocks, bool)
+        or not isinstance(reserved_blocks, int)
+        or not 0 <= reserved_blocks <= KV_RETURN_MAX_INTEGER
+    ):
+        raise KVReturnProtocolError(
+            f"KV return {operation} response reserved_blocks has the wrong type"
+        )
+    if status != KVReturnControlStatus.READY and reserved_blocks != 0:
+        raise KVReturnProtocolError(
+            f"KV return {operation} rejection reserved unexpected blocks"
+        )
+    return KVReturnControlResponse(
+        operation=operation,
+        protocol_version=protocol_version,
+        http_status=http_status,
+        status=status,
+        reason=reason,
+        idempotent=idempotent,
+        reserved_blocks=reserved_blocks,
+    )
+
+
+def _validate_peer(host: str, port: int) -> None:
+    if not isinstance(host, str) or not host:
+        raise KVReturnProtocolError("KV return host must be a nonempty string")
+    if (
+        isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 1 <= port <= 65535
+    ):
+        raise KVReturnProtocolError("KV return port must be between 1 and 65535")
 
 
 def _bracket(host: str) -> str:

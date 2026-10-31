@@ -13,6 +13,7 @@ import time
 from typing import Callable, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from fakeengine.config import SimConfig
     from fakeengine.scheduler import PrefixImportReservation, Scheduler
 
 
@@ -98,6 +99,29 @@ class KVReturnResult:
     idempotent: bool = False
 
 
+def kv_return_compatibility(
+    config: "SimConfig",
+    prefill_dp_rank: int,
+    *,
+    kv_layout_fingerprint: Optional[str] = None,
+) -> KVReturnCompatibility:
+    """Build the shared compatibility contract for either side of a return."""
+    return KVReturnCompatibility(
+        protocol_version=config.kv_return_protocol_version,
+        prefill_dp_rank=prefill_dp_rank,
+        served_model_name=config.served_model_name,
+        model_identity=config.model_path,
+        vocab_size=config.vocab_size,
+        block_size=config.block_size,
+        kv_bytes_per_token=config.kv_return_bytes_per_token,
+        kv_layout_fingerprint=kv_layout_fingerprint or _fingerprint({
+            "layout": "fake-sglang-kv-v1",
+            "block_size": config.block_size,
+            "kv_bytes_per_token": config.kv_return_bytes_per_token,
+        }),
+    )
+
+
 @dataclass
 class _Attempt:
     ticket: KVReturnTicket
@@ -150,19 +174,10 @@ class KVReturnManager:
         self.terminal_ttl_s = terminal_ttl_s
         self.max_terminal_records = max_terminal_records
         self._clock = clock
-        self.compatibility = KVReturnCompatibility(
-            protocol_version=self.config.kv_return_protocol_version,
-            prefill_dp_rank=dp_rank,
-            served_model_name=self.config.served_model_name,
-            model_identity=self.config.model_path,
-            vocab_size=self.config.vocab_size,
-            block_size=self.config.block_size,
-            kv_bytes_per_token=self.config.kv_return_bytes_per_token,
-            kv_layout_fingerprint=kv_layout_fingerprint or _fingerprint({
-                "layout": "fake-sglang-kv-v1",
-                "block_size": self.config.block_size,
-                "kv_bytes_per_token": self.config.kv_return_bytes_per_token,
-            }),
+        self.compatibility = kv_return_compatibility(
+            self.config,
+            dp_rank,
+            kv_layout_fingerprint=kv_layout_fingerprint,
         )
         self._attempts: Dict[str, _Attempt] = {}
         self._terminal: "OrderedDict[str, _Terminal]" = OrderedDict()
