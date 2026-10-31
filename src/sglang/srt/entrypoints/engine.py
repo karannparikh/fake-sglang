@@ -96,6 +96,7 @@ class TokenizerManager:
             cache_salt=getattr(obj, "cache_salt", None),
             routed_dp_rank=getattr(obj, "routed_dp_rank", None),
             data_parallel_rank=getattr(obj, "data_parallel_rank", None),
+            retain_response_kv=getattr(obj, "retain_response_kv", False),
         )
         async with aclosing(stream):
             async for chunk in stream:
@@ -104,8 +105,7 @@ class TokenizerManager:
     def abort_request(self, rid: str = "", abort_all: bool = False) -> None:
         for scheduler in self._engine.schedulers:
             if abort_all:
-                for pending in list(scheduler.by_rid):
-                    scheduler.abort(pending)
+                scheduler.abort_all()
             elif rid:
                 scheduler.abort(rid)
 
@@ -363,6 +363,7 @@ class Engine:
         cache_salt: Optional[Union[List[str], str]] = None,
         routed_dp_rank: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        retain_response_kv: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[dict]:
         """Returns the stream; the caller awaits this, then iterates it.
@@ -384,6 +385,8 @@ class Engine:
         ignore_eos = bool(params.get("ignore_eos", False))
         min_new = int(params.get("min_new_tokens") or 0)
         request_id = str(rid or uuid.uuid4().hex)
+        if not isinstance(retain_response_kv, bool):
+            raise ValueError("retain_response_kv must be a boolean")
 
         return self._generate_stream(
             request_id=request_id,
@@ -395,6 +398,7 @@ class Engine:
             cache_salt=_single_salt(cache_salt),
             scheduler=self.schedulers[rank],
             dp_rank=rank,
+            retain_response_kv=retain_response_kv,
             ignore_eos=ignore_eos,
             min_new_tokens=min_new,
         )
@@ -459,6 +463,7 @@ class Engine:
         scheduler: Scheduler,
         dp_rank: int,
         cache_salt: Optional[str] = None,
+        retain_response_kv: bool = False,
         ignore_eos: bool = False,
         min_new_tokens: int = 0,
     ) -> AsyncIterator[dict]:
@@ -475,6 +480,8 @@ class Engine:
                 bootstrap_room,
                 started,
                 scheduler,
+                cache_salt,
+                retain_response_kv,
                 ignore_eos,
                 min_new_tokens,
             )) as stream:
@@ -531,6 +538,8 @@ class Engine:
         bootstrap_room: int,
         started: float,
         scheduler: Scheduler,
+        cache_salt: Optional[str],
+        retain_response_kv: bool,
         ignore_eos: bool = False,
         min_new_tokens: int = 0,
     ) -> AsyncIterator[dict]:
@@ -560,15 +569,25 @@ class Engine:
             max(max_new_tokens, 1),
             prebuilt=True,
             first_token=handoff,
+            cache_salt=cache_salt,
+            retain_response_kv=retain_response_kv,
             ignore_eos=ignore_eos,
             min_new_tokens=min_new_tokens,
         )
         scheduler.submit(request)
+        terminal_delivered = False
         try:
             async for chunk in self._drain(request, started):
+                if chunk["meta_info"]["finish_reason"] is not None:
+                    terminal_delivered = True
                 yield chunk
         finally:
             scheduler.abort(request_id)
+            if request.retention_lease is not None and not terminal_delivered:
+                scheduler.release_retention(
+                    request.retention_lease,
+                    reason="undelivered",
+                )
 
     async def _drain(self, request: Request, started: float) -> AsyncIterator[dict]:
         """Turn separated per-request outputs into SGLang response chunks."""
