@@ -25,6 +25,7 @@ from fakeengine.kv_return_client import (
     return_generated_kv,
 )
 from fakeengine.scheduler import Scheduler
+from fakeengine.topology import TopologyError
 
 
 TOPOLOGY = {
@@ -129,6 +130,7 @@ async def test_return_helper_uses_real_endpoints_and_generated_bytes_only(
                 port=unused_port,
                 room_metadata=metadata,
                 generated_token_ids=generated,
+                cache_salt="tenant-a",
                 sleep=_no_sleep,
             )
     finally:
@@ -144,6 +146,81 @@ async def test_return_helper_uses_real_endpoints_and_generated_bytes_only(
     assert scheduler.pool.match_prefix(
         block_hashes(prompt + generated, 4, "tenant-a")
     ) == 3
+
+
+async def test_ticket_cache_salt_must_match_decode_request_before_network(
+    server_args,
+    unused_port,
+):
+    scheduler = _scheduler(server_args)
+    server = BootstrapServer(
+        "127.0.0.1",
+        unused_port,
+        kv_return_managers=[scheduler.kv_return],
+    )
+    metadata = _publish(
+        server,
+        scheduler,
+        46,
+        salt="tenant-a",
+    )
+    decode = _config(server_args, "decode")
+    client = BootstrapClient(0.001, 1)
+
+    with pytest.raises(KVReturnProtocolError, match="cache salt"):
+        await return_generated_kv(
+            decode,
+            client,
+            host="127.0.0.1",
+            port=unused_port,
+            room_metadata=metadata,
+            generated_token_ids=(5, 6, 7, 8),
+            cache_salt="tenant-b",
+            sleep=_no_sleep,
+        )
+
+    assert client._session is None
+    attempt = next(iter(scheduler.kv_return._attempts.values()))
+    assert attempt.reservation is None
+
+
+async def test_topology_failure_aborts_prepared_reservation(
+    server_args,
+    unused_port,
+):
+    topology = json.dumps(TOPOLOGY)
+    scheduler = _scheduler(
+        server_args,
+        fake_topology=topology,
+        fake_location="z/r/p",
+    )
+    decode = _config(
+        server_args,
+        "decode",
+        fake_topology=topology,
+        fake_location="z/r/d",
+    )
+    client = BootstrapClient(0.001, 1)
+    try:
+        async with _running_server(scheduler, unused_port) as server:
+            metadata = _publish(server, scheduler, 47)
+            metadata["location"] = "malformed"
+
+            with pytest.raises(TopologyError):
+                await return_generated_kv(
+                    decode,
+                    client,
+                    host="127.0.0.1",
+                    port=unused_port,
+                    room_metadata=metadata,
+                    generated_token_ids=(5, 6, 7, 8),
+                    sleep=_no_sleep,
+                )
+
+            assert scheduler.kv_return._attempts == {}
+            assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+    finally:
+        await client.close()
 
 
 async def test_prepare_rejection_never_starts_payload_transfer(

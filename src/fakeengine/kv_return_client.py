@@ -101,6 +101,7 @@ async def return_generated_kv(
     port: int,
     room_metadata: Mapping[str, Any],
     generated_token_ids: Sequence[int],
+    cache_salt: Optional[str] = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> KVReturnOutcome:
     """Prepare, simulate generated-KV transfer, and commit one exact ticket."""
@@ -109,6 +110,7 @@ async def return_generated_kv(
         config,
         room_metadata,
         generated_token_ids,
+        cache_salt=cache_salt,
     )
     deadline = started_at + min(
         client.timeout_s,
@@ -164,19 +166,16 @@ async def return_generated_kv(
             prepare_response=prepared,
         )
 
-    link = _reverse_link(config, prefill_location)
-    transfer_ms = TimingModel(config).kv_return_transfer_ms(
-        len(generated),
-        link,
-    )
-    if not math.isfinite(transfer_ms) or transfer_ms < 0:
-        primary = KVReturnProtocolError(
-            "KV return transfer duration must be finite and nonnegative"
-        )
-        await _best_effort_abort(client, host, port, ticket)
-        raise primary
-
     try:
+        link = _reverse_link(config, prefill_location)
+        transfer_ms = TimingModel(config).kv_return_transfer_ms(
+            len(generated),
+            link,
+        )
+        if not math.isfinite(transfer_ms) or transfer_ms < 0:
+            raise KVReturnProtocolError(
+                "KV return transfer duration must be finite and nonnegative"
+            )
         sleep_seconds = transfer_ms / 1000.0 / config.speedup_ratio
         if sleep_seconds > 0:
             remaining = deadline - time.monotonic()
@@ -233,6 +232,8 @@ def _validate_operation(
     config: SimConfig,
     room_metadata: Mapping[str, Any],
     generated_token_ids: Sequence[int],
+    *,
+    cache_salt: Optional[str],
 ) -> Tuple[KVReturnTicket, Tuple[int, ...], Optional[str]]:
     if not isinstance(room_metadata, Mapping):
         raise KVReturnProtocolError("room metadata must be an object")
@@ -243,6 +244,10 @@ def _validate_operation(
     if "kv_return" not in room_metadata:
         raise KVReturnProtocolError("room metadata has no kv_return ticket")
     ticket = parse_kv_return_ticket(room_metadata["kv_return"])
+    if ticket.cache_salt != (cache_salt or None):
+        raise KVReturnProtocolError(
+            "KV return ticket cache salt does not match the decode request"
+        )
     local = kv_return_compatibility(
         config,
         ticket.compatibility.prefill_dp_rank,
