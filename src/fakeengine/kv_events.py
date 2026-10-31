@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,

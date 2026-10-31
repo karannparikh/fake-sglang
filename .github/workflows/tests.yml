@@ -60,6 +60,10 @@ jobs:
           python -m pip install 'maturin>=1,<2' 'transformers>=4.56.0'
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Run static lint
+        working-directory: fake-sglang
+        run: python -m ruff check .
+
       - name: Build Dynamo Python binding
         working-directory: dynamo/lib/bindings/python
         run: |

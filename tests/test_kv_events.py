@@ -15,7 +15,6 @@ import pytest
 import zmq
 
 from sglang import Engine
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 
 BLOCK_SIZE = 4
 

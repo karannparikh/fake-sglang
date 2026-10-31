@@ -121,7 +121,7 @@ async def test_room_is_released_once_the_transfer_lands(pd_pair):
     {},
     {"enable_kv_return": True, "disable_radix_cache": True},
 ])
-async def test_kv_return_metadata_is_omitted_when_ineligible(
+async def test_kv_return_metadata_is_none_when_ineligible(
     server_args,
     unused_port,
     overrides,
@@ -140,9 +140,10 @@ async def test_kv_return_metadata_is_omitted_when_ineligible(
             "kv_bytes",
             "first_token",
             "location",
+            "kv_return",
             "ready_ts",
         }
-        assert "kv_return" not in metadata
+        assert metadata["kv_return"] is None
     finally:
         await prefill._async_shutdown()
 
