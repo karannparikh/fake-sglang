@@ -364,6 +364,9 @@ async def test_ineligible_requests_preserve_response_without_return(
         assert decode.scheduler.pool.can_allocate(
             decode.scheduler.pool.num_blocks
         )
+        assert decode.scheduler.stats()["kv_return_rejected_by_reason"] == (
+            {"invalid_ticket": 1} if mutate_ticket else {}
+        )
     finally:
         await decode._async_shutdown()
         await prefill._async_shutdown()

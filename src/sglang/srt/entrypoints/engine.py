@@ -671,7 +671,7 @@ class Engine:
             and self.sim_config.enable_kv_return
             and self.sim_config.prefix_caching
             and not receiver.is_fake_host
-            and "kv_return" in metadata
+            and metadata.get("kv_return") is not None
         ):
             return None
         try:
