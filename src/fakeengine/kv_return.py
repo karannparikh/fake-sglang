@@ -376,6 +376,23 @@ class KVReturnManager:
         self._attempts.clear()
         self._terminal.clear()
 
+    def clear_ticket(self, ticket: KVReturnTicket) -> bool:
+        """Release and forget one exact ticket, including terminal state."""
+        attempt = self._attempts.get(ticket.nonce)
+        if attempt is not None:
+            if attempt.ticket != ticket:
+                return False
+            if attempt.reservation is not None:
+                self.scheduler.release_prefix_import(attempt.reservation)
+            self._attempts.pop(ticket.nonce, None)
+            return True
+
+        terminal = self._terminal.get(ticket.nonce)
+        if terminal is None or terminal.ticket != ticket:
+            return False
+        self._terminal.pop(ticket.nonce, None)
+        return True
+
     def _valid_prepare(
         self,
         attempt: _Attempt,
