@@ -21,6 +21,7 @@ from fakeengine.config import SimConfig
 from fakeengine.kvcache import block_hashes
 from fakeengine.kv_return import KVReturnResult, KVReturnStatus
 from fakeengine.kv_return_client import (
+    KVReturnLeaseLostError,
     KVReturnOutcomeStatus,
     return_generated_kv,
 )
@@ -322,6 +323,47 @@ async def test_one_client_timeout_covers_simulated_transfer_and_aborts(
                     generated_token_ids=(5, 6, 7, 8),
                 )
             assert scheduler.kv_return._attempts == {}
+            assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+    finally:
+        await client.close()
+
+
+async def test_source_lease_loss_aborts_before_commit(
+    server_args,
+    unused_port,
+):
+    scheduler = _scheduler(server_args)
+    decode = _config(server_args, "decode")
+    client = BootstrapClient(0.001, 1)
+    ownership = iter((True, True, False))
+    commit_calls = 0
+    original_commit = scheduler.kv_return.commit
+
+    def record_commit(commit):
+        nonlocal commit_calls
+        commit_calls += 1
+        return original_commit(commit)
+
+    scheduler.kv_return.commit = record_commit
+    try:
+        async with _running_server(scheduler, unused_port) as server:
+            metadata = _publish(server, scheduler, 46)
+            with pytest.raises(KVReturnLeaseLostError):
+                await return_generated_kv(
+                    decode,
+                    client,
+                    host="127.0.0.1",
+                    port=unused_port,
+                    room_metadata=metadata,
+                    generated_token_ids=(5, 6, 7, 8),
+                    sleep=_no_sleep,
+                    owns_source=lambda: next(ownership),
+                )
+            assert commit_calls == 0
+            assert scheduler.kv_return._attempts == {}
+            assert scheduler.pool.match_prefix(
+                block_hashes((1, 2, 3, 4, 5, 6, 7, 8), 4)
+            ) == 1
             assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
     finally:
         await client.close()

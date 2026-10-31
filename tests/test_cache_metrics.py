@@ -209,12 +209,18 @@ def test_engine_metrics_export_through_multiprocess_collector():
         registry = CollectorRegistry()
         MultiProcessCollector(registry)
 
-        def value(name):
-            return registry.get_sample_value(name, {"dp_rank": "0"})
+        def value(name, labels=None):
+            combined = {"dp_rank": "0"}
+            combined.update(labels or {})
+            return registry.get_sample_value(name, combined)
 
         prefix = "sglang:simulated_prefix_cache_"
         assert value(prefix + "capacity_tokens") == 16
         assert value(prefix + "query_tokens_total") == 0
+        return_prefix = "sglang:simulated_kv_return_"
+        assert value(return_prefix + "attempts_total") == 0
+        assert value(return_prefix + "active_tasks") == 0
+        assert value(return_prefix + "retained_blocks") == 0
 
         async def run():
             try:
@@ -233,6 +239,31 @@ def test_engine_metrics_export_through_multiprocess_collector():
                 assert value(prefix + "resident_tokens") == 0
                 assert value(prefix + "cleared_tokens_total") == 8
                 assert value(prefix + "evicted_tokens_total") == 0
+                engine.scheduler.record_kv_return_attempt()
+                engine.scheduler.record_kv_return_rejected("task_limit")
+                engine.scheduler.record_kv_return_failed("transport")
+                engine.scheduler.record_kv_return_stored(
+                    tokens=4,
+                    payload_bytes=128,
+                    transfer_ms=7,
+                    commit_ms=3,
+                )
+                engine.scheduler.record_kv_return_task_finished()
+                assert value(return_prefix + "attempts_total") == 1
+                assert value(return_prefix + "stored_total") == 1
+                assert value(
+                    return_prefix + "rejected_total",
+                    {"reason": "task_limit"},
+                ) == 1
+                assert value(
+                    return_prefix + "failed_total",
+                    {"reason": "transport"},
+                ) == 1
+                assert value(return_prefix + "tokens_total") == 4
+                assert value(return_prefix + "bytes_total") == 128
+                assert value(return_prefix + "transfer_seconds_total") == 0.007
+                assert value(return_prefix + "commit_seconds_total") == 0.003
+                assert value(return_prefix + "active_tasks") == 0
             finally:
                 await engine._async_shutdown()
 

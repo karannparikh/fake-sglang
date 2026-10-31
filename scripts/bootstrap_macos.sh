@@ -102,7 +102,7 @@ fi
 step "6/7 install ai-dynamo (frontend + sglang backend) and fake-sglang"
 cd "$DYNAMO"
 uv pip install -e .            # NOT .[sglang] -- that extra pulls CUDA wheels
-uv pip install -e "$FAKE_SGLANG"
+uv pip install -e "$FAKE_SGLANG[dev]"
 # Imported at module scope by dynamo.sglang.request_handlers.llm.decode_handler.
 uv pip install torch pillow
 # Not declared by ai-dynamo itself, but imported by the SGLang backend.
@@ -123,6 +123,8 @@ verify() {
   fi
 }
 python -c "import sglang; assert sglang.__is_fake_sglang__; print('sglang shim ->', sglang.__file__)"
+verify pytest          python -m pytest --version
+verify ruff            python -m ruff --version
 verify dynamo.frontend python -m dynamo.frontend --help
 verify dynamo.sglang   python -m dynamo.sglang --help
 if [ "$verify_failed" -ne 0 ]; then

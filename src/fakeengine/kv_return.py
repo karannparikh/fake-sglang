@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from enum import Enum
 import hashlib
 import json

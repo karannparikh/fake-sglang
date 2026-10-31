@@ -141,6 +141,55 @@ async def test_expiry_and_scheduler_shutdown_release_every_lease(server_args):
     assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
 
 
+async def test_claimed_lease_is_owner_checked_and_exempt_from_idle_expiry(
+    server_args,
+):
+    now = [100.0]
+    scheduler = scheduler_for(
+        server_args,
+        clock=lambda: now[0],
+        fake_kv_return_retention_timeout_ms=100,
+    )
+    request = await finish_prebuilt(
+        scheduler,
+        list(range(4)),
+        1,
+        rid="claimed",
+    )
+    lease = request.retention_lease
+    assert lease.deadline == pytest.approx(100.1)
+
+    now[0] = 100.09
+    claim = scheduler.claim_retention(lease)
+    assert claim is not None
+    assert claim.deadline == pytest.approx(100.19)
+    assert lease.claimed
+    assert lease.claim_deadline == claim.deadline
+    assert scheduler.claim_retention(lease) is None
+    assert not scheduler.release_retention(lease, reason="generic")
+
+    now[0] = 100.11
+    assert scheduler.expire_retention_leases() == 0
+    assert scheduler.owns_retention_claim(claim)
+    assert not lease.released
+
+    now[0] = 100.18
+    assert scheduler.release_retention(
+        lease,
+        claim=claim,
+        reason="committed",
+    )
+    assert scheduler.release_retention(
+        lease,
+        claim=claim,
+        reason="committed",
+    )
+    assert lease.released
+    assert lease.release_reason == "committed"
+    assert scheduler.claim_retention(lease) is None
+    assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+
+
 async def test_scheduler_loop_expires_idle_lease_without_a_new_request(server_args):
     scheduler = scheduler_for(
         server_args,

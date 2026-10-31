@@ -37,17 +37,17 @@ class SimConfig:
     itl_ms_per_running_req: float
     kv_bandwidth_gb_s: float
     kv_transfer_overhead_ms: float
-    enable_kv_return: bool
-    kv_return_protocol_version: int
-    kv_return_max_tokens: int
-    kv_return_deadline_ms: float
-    kv_return_bytes_per_token: int
-    kv_return_bandwidth_gb_s: float
-    kv_return_overhead_ms: float
-    kv_return_retention_max_leases: int
-    kv_return_retention_max_blocks: int
-    kv_return_retention_max_bytes: int
-    kv_return_retention_timeout_ms: float
+    enable_kv_return: bool  # Advertise reverse-KV return on eligible rooms.
+    kv_return_protocol_version: int  # Version of the return-ticket schema.
+    kv_return_max_tokens: int  # Maximum generated tokens a ticket accepts.
+    kv_return_deadline_ms: float  # Return-ticket deadline in milliseconds.
+    kv_return_bytes_per_token: int  # Reverse payload bytes per generated token.
+    kv_return_bandwidth_gb_s: float  # Simulated reverse-transfer bandwidth.
+    kv_return_overhead_ms: float  # Fixed reverse-transfer cost in milliseconds.
+    kv_return_retention_max_leases: int  # Maximum active decode KV leases.
+    kv_return_retention_max_blocks: int  # Maximum retained decode KV blocks.
+    kv_return_retention_max_bytes: int  # Maximum retained decode KV bytes.
+    kv_return_retention_timeout_ms: float  # Decode KV lease lifetime.
     speedup_ratio: float
 
     bootstrap_host: Optional[str]

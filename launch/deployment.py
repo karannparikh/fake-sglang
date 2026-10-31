@@ -414,8 +414,8 @@ def describe(procs: List[Proc], topology: Optional[Topology]) -> str:
             row = "".join(f"{cell(p, d):>{width}}" for d in decodes)
             lines.append(f"  {p.name:<14}{row}")
         lines += ["", "  links:"] + [
-            f"    {l.name:<10} {l.bandwidth_gb_s:>8g} GB/s  {l.latency_ms:>6g} ms"
-            for l in topology.links.values()
+            f"    {link.name:<10} {link.bandwidth_gb_s:>8g} GB/s  {link.latency_ms:>6g} ms"
+            for link in topology.links.values()
         ]
     return "\n".join(lines)
 
