@@ -47,6 +47,46 @@ FINISH_STOP = "stop"
 FINISH_LENGTH = "length"
 FINISH_ABORT = "abort"
 
+_KV_RETURN_REJECTION_REASONS = frozenset({
+    "invalid_ticket",
+    "invalid_payload",
+    "task_limit",
+    "task_creation",
+    "lease_unavailable",
+    "shutdown",
+    "retention_capacity",
+    "retention_lease_budget",
+    "retention_block_budget",
+    "retention_byte_budget",
+    "retention_duplicate_request",
+    "prepare_disabled",
+    "prepare_expired",
+    "prepare_capacity_rejected",
+    "prepare_incompatible",
+    "prepare_not_found",
+    "commit_disabled",
+    "commit_expired",
+    "commit_capacity_rejected",
+    "commit_incompatible",
+    "commit_invalid_token_ids",
+    "commit_checksum_mismatch",
+    "commit_not_prepared",
+    "commit_import_failed",
+    "commit_not_found",
+    "other",
+})
+_KV_RETURN_FAILURE_REASONS = frozenset({
+    "prepare_timeout",
+    "transfer_timeout",
+    "commit_timeout",
+    "deadline_timeout",
+    "transport",
+    "protocol",
+    "lease_lost",
+    "cancelled",
+    "unexpected",
+})
+
 
 @dataclass
 class PrefixImportReservation:
@@ -68,6 +108,9 @@ class _KVRetentionState:
     released: bool = False
     released_at: Optional[float] = None
     release_reason: Optional[str] = None
+    claim_token: Optional[object] = None
+    claimed_at: Optional[float] = None
+    claim_deadline: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +144,23 @@ class KVRetentionLease:
     @property
     def release_reason(self) -> Optional[str]:
         return self._state.release_reason
+
+    @property
+    def claimed(self) -> bool:
+        return self._state.claim_token is not None and not self.released
+
+    @property
+    def claim_deadline(self) -> Optional[float]:
+        return self._state.claim_deadline
+
+
+@dataclass(frozen=True)
+class KVRetentionClaim:
+    lease: KVRetentionLease
+    claimed_at: float
+    deadline: float
+    _owner: object = field(repr=False, compare=False)
+    _token: object = field(repr=False, compare=False)
 
 
 class Request:
@@ -273,7 +333,17 @@ class Scheduler:
         self._retained_blocks = 0
         self._retained_bytes = 0
         self._retention_rejections = 0
+        self._kv_return_attempts = 0
+        self._kv_return_stored = 0
+        self._kv_return_rejected_by_reason: Dict[str, int] = {}
+        self._kv_return_failed_by_reason: Dict[str, int] = {}
+        self._kv_return_tokens = 0
+        self._kv_return_bytes = 0
+        self._kv_return_transfer_ms = 0.0
+        self._kv_return_commit_ms = 0.0
+        self._kv_return_active_tasks = 0
         self._clock = clock or time.monotonic
+        self._publish_kv_return_state()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -360,6 +430,7 @@ class Scheduler:
         self,
         lease: KVRetentionLease,
         *,
+        claim: Optional[KVRetentionClaim] = None,
         reason: str = "released",
         now: Optional[float] = None,
     ) -> bool:
@@ -367,6 +438,17 @@ class Scheduler:
             not isinstance(lease, KVRetentionLease)
             or lease._owner is not self._retention_owner
         ):
+            return False
+        claim_token = lease._state.claim_token                   # noqa: SLF001
+        if claim_token is not None:
+            if (
+                not isinstance(claim, KVRetentionClaim)
+                or claim._owner is not self._retention_owner
+                or claim.lease is not lease
+                or claim._token is not claim_token
+            ):
+                return False
+        elif claim is not None:
             return False
         if lease.released:
             return True
@@ -386,14 +468,63 @@ class Scheduler:
         self._retained_blocks -= lease.block_count
         self._retained_bytes -= lease.retained_bytes
         self.pool.free(lease.block_ids)
+        self._publish_kv_return_state()
         return True
+
+    def claim_retention(
+        self,
+        lease: KVRetentionLease,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[KVRetentionClaim]:
+        if (
+            not isinstance(lease, KVRetentionLease)
+            or lease._owner is not self._retention_owner
+        ):
+            return None
+        current = self._clock() if now is None else now
+        if (
+            lease.released
+            or lease._state.claim_token is not None              # noqa: SLF001
+            or self._retention_leases.get(lease.lease_id) is not lease
+        ):
+            return None
+        if lease.deadline <= current:
+            self.release_retention(lease, reason="expired", now=current)
+            return None
+
+        token = object()
+        deadline = (
+            current
+            + self.config.kv_return_retention_timeout_ms / 1000.0
+        )
+        lease._state.claim_token = token                          # noqa: SLF001
+        lease._state.claimed_at = current                         # noqa: SLF001
+        lease._state.claim_deadline = deadline                    # noqa: SLF001
+        return KVRetentionClaim(
+            lease,
+            current,
+            deadline,
+            self._retention_owner,
+            token,
+        )
+
+    def owns_retention_claim(self, claim: KVRetentionClaim) -> bool:
+        return (
+            isinstance(claim, KVRetentionClaim)
+            and claim._owner is self._retention_owner
+            and self._retention_leases.get(claim.lease.lease_id)
+            is claim.lease
+            and not claim.lease.released
+            and claim.lease._state.claim_token is claim._token   # noqa: SLF001
+        )
 
     def expire_retention_leases(self, now: Optional[float] = None) -> int:
         current = self._clock() if now is None else now
         expired = [
             lease
             for lease in self._retention_leases.values()
-            if lease.deadline <= current
+            if not lease.claimed and lease.deadline <= current
         ]
         for lease in sorted(expired, key=lambda item: (item.deadline, item.lease_id)):
             self.release_retention(lease, reason="expired", now=current)
@@ -518,6 +649,62 @@ class Scheduler:
 
     # -- stats -------------------------------------------------------------
 
+    def record_kv_return_attempt(self) -> None:
+        self._kv_return_attempts += 1
+        self._kv_return_active_tasks += 1
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_attempt()
+        self._publish_kv_return_state()
+
+    def record_kv_return_task_finished(self) -> None:
+        if self._kv_return_active_tasks > 0:
+            self._kv_return_active_tasks -= 1
+        self._publish_kv_return_state()
+
+    def record_kv_return_stored(
+        self,
+        *,
+        tokens: int,
+        payload_bytes: int,
+        transfer_ms: float,
+        commit_ms: float,
+    ) -> None:
+        self._kv_return_stored += 1
+        self._kv_return_tokens += tokens
+        self._kv_return_bytes += payload_bytes
+        self._kv_return_transfer_ms += transfer_ms
+        self._kv_return_commit_ms += commit_ms
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_stored(
+                tokens,
+                payload_bytes,
+                transfer_ms,
+                commit_ms,
+            )
+
+    def record_kv_return_rejected(self, reason: str) -> None:
+        bounded = reason if reason in _KV_RETURN_REJECTION_REASONS else "other"
+        self._kv_return_rejected_by_reason[bounded] = (
+            self._kv_return_rejected_by_reason.get(bounded, 0) + 1
+        )
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_rejected(bounded)
+
+    def record_kv_return_failed(self, reason: str) -> None:
+        bounded = reason if reason in _KV_RETURN_FAILURE_REASONS else "unexpected"
+        self._kv_return_failed_by_reason[bounded] = (
+            self._kv_return_failed_by_reason.get(bounded, 0) + 1
+        )
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_failed(bounded)
+
+    def _publish_kv_return_state(self) -> None:
+        if self.cache_metrics is not None:
+            self.cache_metrics.update_kv_return(
+                active_tasks=self._kv_return_active_tasks,
+                retained_blocks=self._retained_blocks,
+            )
+
     def _publish_cache_state(self) -> None:
         if self.cache_metrics is not None:
             self.cache_metrics.update_pool(self.pool)
@@ -543,6 +730,19 @@ class Scheduler:
             "kv_retention_blocks": self._retained_blocks,
             "kv_retention_bytes": self._retained_bytes,
             "kv_retention_rejections": self._retention_rejections,
+            "kv_return_attempts": self._kv_return_attempts,
+            "kv_return_stored": self._kv_return_stored,
+            "kv_return_rejected_by_reason": dict(
+                self._kv_return_rejected_by_reason
+            ),
+            "kv_return_failed_by_reason": dict(
+                self._kv_return_failed_by_reason
+            ),
+            "kv_return_tokens": self._kv_return_tokens,
+            "kv_return_bytes": self._kv_return_bytes,
+            "kv_return_transfer_ms": self._kv_return_transfer_ms,
+            "kv_return_commit_ms": self._kv_return_commit_ms,
+            "kv_return_active_tasks": self._kv_return_active_tasks,
         }
 
     # -- the loop ----------------------------------------------------------
@@ -622,9 +822,13 @@ class Scheduler:
         timeouts: List[float] = []
         if self.fpm is not None:
             timeouts.append(1.0)
-        if self._retention_leases:
+        idle_leases = [
+            lease for lease in self._retention_leases.values()
+            if not lease.claimed
+        ]
+        if idle_leases:
             next_deadline = min(
-                lease.deadline for lease in self._retention_leases.values()
+                lease.deadline for lease in idle_leases
             )
             timeouts.append(max(next_deadline - self._clock(), 0.0))
         return min(timeouts) if timeouts else None
@@ -1000,6 +1204,7 @@ class Scheduler:
         self._retained_blocks += block_count
         self._retained_bytes += retained_bytes
         request.retention_lease = lease
+        self._publish_kv_return_state()
         self._wakeup.set()
         return lease
 
