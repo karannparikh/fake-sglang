@@ -110,11 +110,9 @@ def test_transfer_time_is_inversely_proportional_to_bandwidth(server_args):
 async def _drain(request: Request) -> tuple:
     tokens, reason = [], None
     while True:
-        kind, payload = await request.queue.get()
-        if kind == "token":
-            tokens.append(payload)
-        else:
-            reason = payload
+        output_ids, reason = await request.next_output()
+        tokens.extend(output_ids)
+        if reason is not None:
             return tokens, reason
 
 
