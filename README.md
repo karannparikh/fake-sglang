@@ -417,10 +417,18 @@ The existing bootstrap sweeper expires manager attempts; an unclaimed room's
 expiry clears its active or terminal ticket state, and server shutdown releases
 all reservations and idempotency records.
 
-This layer is server control only. It has no decode-side reverse
-`BootstrapClient`, response-KV retention, reverse-transfer timing or sleep,
-background return task, or end-to-end next-turn orchestration. Normal decode
-generation does not invoke these endpoints yet.
+`BootstrapClient` now has strict typed prepare, commit, and abort operations,
+and `fakeengine.kv_return_client.return_generated_kv` can execute one explicit
+prepare -> simulated reverse payload -> commit sequence from the exact
+`kv_return` ticket in room metadata. The helper shares one ticket/client
+deadline across all three phases, uses only generated-response KV bytes, uses
+the decode-to-prefill topology link when both locations are known, and
+best-effort aborts a prepared attempt when transfer or commit fails.
+
+This helper is intentionally not connected to decode completion. Decode
+scheduler blocks are not retained for it, generation does not schedule it,
+client response timing and metadata are unchanged, and there is no background
+return task or end-to-end next-turn orchestration yet.
 
 ## KV-aware routing
 
