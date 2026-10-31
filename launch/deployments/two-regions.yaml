@@ -1,0 +1,44 @@
+# Two regions, prefill and decode split across them.
+#
+# Each prefill worker has a decode worker in its own zone, one in another
+# cluster and one in the other region. A topology-blind router picks among
+# them by load alone, so roughly half the handoffs cross the slow
+# inter-region link. Grep the workers' output for "over 'default' link" to
+# count them.
+#
+#   ./launch/deployment.sh launch/deployments/two-regions.yaml
+
+model: models/qwen3-0.6b          # relative to the repo, an absolute path, or an HF id
+served_model_name: fake-model
+
+frontend:
+  http_port: 8000
+  router_mode: kv                 # round-robin | random | kv  (kv turns on KV events)
+  args: []
+
+defaults:                         # applied to every worker
+  page_size: 256
+  args: []                        # e.g. [--fake-itl-ms, 12]
+
+# A location is one path component per level, outermost first. A transfer
+# crosses the link named by the deepest level both ends share:
+#   zone    - same zone              (region, cluster and zone equal)
+#   cluster - same cluster, other zone
+#   region  - same region, other cluster
+#   default - different regions
+topology:
+  levels: [region, cluster, zone]
+  links:
+    zone:    {bandwidth_gb_s: 450,  latency_ms: 0.01}   # same zone
+    cluster: {bandwidth_gb_s: 50,   latency_ms: 0.05}   # same cluster, other zone
+    region:  {bandwidth_gb_s: 12.5, latency_ms: 0.5}    # same region, other cluster
+    default: {bandwidth_gb_s: 1.25, latency_ms: 5}      # inter-region
+
+workers:
+  # role: prefill | decode | agg.  count defaults to 1.  args/env are per group.
+  - {role: prefill, count: 1, location: region-a/cluster-1/zone-1}
+  - {role: prefill, count: 1, location: region-b/cluster-1/zone-1}
+  - {role: decode,  count: 1, location: region-a/cluster-1/zone-1}
+  - {role: decode,  count: 1, location: region-a/cluster-2/zone-1}
+  - {role: decode,  count: 1, location: region-b/cluster-1/zone-1}
+  - {role: decode,  count: 1, location: region-b/cluster-2/zone-1}

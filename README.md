@@ -196,31 +196,31 @@ Any flag is forwarded to the workers, so you can dial the simulation:
 ./launch/disagg.sh --fake-kv-bandwidth-gb-s 1 --fake-itl-ms 25
 ```
 
-## Clusters and network topology
+## Multi-worker deployments and network topology
 
-`launch/cluster.sh` runs any mix of workers from a YAML file: how many prefill,
+`launch/deployment.sh` runs any mix of workers from a YAML file: how many prefill,
 decode and aggregated workers, where each group sits in the network, and what
 a KV transfer costs over each kind of link.
 
 ```bash
-./launch/cluster.sh launch/clusters/two-zones.yaml --dry-run   # print the plan only
-./launch/cluster.sh launch/clusters/two-zones.yaml             # run it
-./launch/cluster.sh launch/clusters/mixed.yaml -- --fake-itl-ms 20   # args after -- go to every worker
+./launch/deployment.sh launch/deployments/two-regions.yaml --dry-run   # print the plan only
+./launch/deployment.sh launch/deployments/two-regions.yaml             # run it
+./launch/deployment.sh launch/deployments/mixed.yaml -- --fake-itl-ms 20   # args after -- go to every worker
 ```
 
 ```yaml
 frontend: {router_mode: kv}          # kv also turns on per-worker KV events
 topology:
-  levels: [zone, rack, node]         # a location has one component per level
+  levels: [region, cluster, zone]    # a location has one component per level
   links:                             # named by the deepest level both ends share
-    node:    {bandwidth_gb_s: 450,  latency_ms: 0.01}   # same node
-    rack:    {bandwidth_gb_s: 50,   latency_ms: 0.05}   # same rack, other node
-    zone:    {bandwidth_gb_s: 12.5, latency_ms: 0.5}    # same zone, other rack
+    zone:    {bandwidth_gb_s: 450,  latency_ms: 0.01}   # same zone
+    cluster: {bandwidth_gb_s: 50,   latency_ms: 0.05}   # same cluster, other zone
+    region:  {bandwidth_gb_s: 12.5, latency_ms: 0.5}    # same region, other cluster
     default: {bandwidth_gb_s: 1.25, latency_ms: 5}      # nothing shared
 workers:
-  - {role: prefill, count: 2, location: zone-a/rack-1/node-1}
-  - {role: decode,  count: 4, location: zone-b/rack-1/node-1, args: [--fake-itl-ms, 12]}
-  - {role: agg,     count: 1, location: zone-a/rack-2/node-1}
+  - {role: prefill, count: 2, location: region-a/cluster-1/zone-1}
+  - {role: decode,  count: 4, location: region-b/cluster-1/zone-1, args: [--fake-itl-ms, 12]}
+  - {role: agg,     count: 1, location: region-a/cluster-2/zone-1}
 ```
 
 The prefill worker publishes its location with each KV room. The decode worker
@@ -229,31 +229,75 @@ looks up the link between the two locations and prices the transfer as
 can count how far KV traveled in a run:
 
 ```
-decode-2 | fake-sglang: KV room 5439... zone-a/rack-1/node-1 -> zone-b/rack-1/node-1 over 'default' link (1.25 GB/s): 2011 tokens, 219.95 MiB, 189.51 ms
+decode-2 | fake-sglang: KV room 5439... region-a/cluster-1/zone-1 -> region-b/cluster-1/zone-1 over 'default' link (1.25 GB/s): 2011 tokens, 219.95 MiB, 189.51 ms
 ```
 
 ```bash
-./launch/cluster.sh launch/clusters/two-zones.yaml --log-dir runs/1
+./launch/deployment.sh launch/deployments/two-regions.yaml --log-dir runs/1
 grep -h "KV room" runs/1/decode-*.log | grep -o "over '[a-z]*'" | sort | uniq -c
 ```
 
 At startup the launcher prints the placement and the link that each
 prefill → decode pair would use. Ports are assigned automatically. Use
 `--dp-size N --enable-dp-attention` in worker arguments to pack ranks;
-the cluster launcher assigns each worker a consecutive range of N KV-event
-ports and checks every rank's port before starting the cluster. The final
+the deployment launcher assigns each worker a consecutive range of N KV-event
+ports and checks every rank's port before starting the deployment. The final
 `--dp-size` value wins across defaults, group arguments, and CLI overrides.
-Use `--port-offset N` to run a cluster beside another deployment. Each run gets
+Use `--port-offset N` to run a deployment beside another one. Each run gets
 its own discovery registry (`DYN_FILE_KV`), so concurrent runs never discover
 each other's workers.
 
-**What Dynamo does with this today: nothing.** In the current Dynamo,
-`PrefillRouter` picks the prefill worker by KV overlap plus load and the
-decode worker by load alone. Nothing links the two choices by distance.
-Measured on `two-zones.yaml` with 20 requests: 11 handoffs crossed zones,
-6 crossed racks within a zone, and 3 stayed on one node. The topology is
-there so you can measure that cost, and measure any topology-aware pairing
-you add to Dynamo against it.
+**By default, Dynamo ignores distance.** `PrefillRouter` picks the prefill
+worker by KV overlap plus load and the decode worker by load alone. Measured
+on `two-regions.yaml` with 20 requests: 11 handoffs crossed regions, 6 crossed
+clusters within a region, and 3 stayed in one zone.
+
+### Keeping handoffs local (`topology.kv_transfer`)
+
+Dynamo has an experimental
+[topology-aware KV transfer](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/developer-guide/knowledge-base/modular-components/router/topology-aware-kv-transfer.md)
+policy. After the router picks a prefill worker, it restricts or biases the
+decode choice to workers in the same topology domain. Turn it on in the
+deployment file:
+
+```yaml
+frontend: {router_mode: kv}         # the policy is applied by the KV router
+topology:
+  levels: [region, cluster, zone]
+  links: {...}
+  kv_transfer: {domain: zone, enforcement: required}
+  # or: {domain: cluster, enforcement: preferred, preferred_weight: 0.85}
+```
+
+The launcher gives each prefill and decode worker a topology directory with
+one file per level. A file's value is the location's full path up to that
+level, such as `region-a/cluster-1`, so a cluster name reused in another
+region is still a different cluster. The launcher also sets the
+`DYN_TOPOLOGY_*` and `DYN_KV_TRANSFER_*` variables that Dynamo's SGLang
+worker reads at registration. Aggregated workers are left alone because they
+never transfer KV. Copies of these variables exported by your shell are not
+passed to any process, so the YAML alone decides the policy.
+
+- **`required`**: only decode workers in the prefill worker's domain are
+  eligible. Dynamo picks the prefill worker without checking for decode
+  capacity, so a prefill worker with no decode worker in its domain would fail
+  every request it gets. The launcher rejects that layout before starting
+  anything.
+- **`preferred`**: a mild bias. Dynamo multiplies a same-domain decode
+  worker's routing cost by `exp(-tanh(preferred_weight))`, so even the
+  maximum weight of 1 only scales it by about 0.47: a local worker still
+  loses to a remote one with less than half its load. The launcher accepts
+  weights above 0 and up to 1 (0 would have no effect).
+
+Only one level is enforced, as an exact match. There is no fallback from zone
+to cluster to region. With `required`, the plan printed at startup marks pairs
+that Dynamo will never use with `-`.
+
+`launch/deployments/zone-local.yaml` puts two prefill and four decode workers in
+two network zones, with the cross-zone link priced as effectively infinite.
+Measured with 20 requests plus a warmup: with `kv_transfer` all 21 handoffs
+stayed in their zone, split 8 and 13 across the two zones. Without it, 13 of
+21 crossed zones.
 
 Aggregated workers serving the same model form their own worker set. The
 frontend splits requests between that set and the prefill → decode set
@@ -283,7 +327,9 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
-| `--fake-location` | unset | This worker's place in the network, e.g. `zone-a/rack-1/node-2` |
+| `--fake-output-len-median` | unset | Median natural answer length in tokens; unset = every request runs to `max_new_tokens` |
+| `--fake-output-len-sigma` | 1.0 | Lognormal shape of the natural answer length |
+| `--fake-location` | unset | This worker's place in the network, e.g. `region-a/cluster-1/zone-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
 
 Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots. The
@@ -332,6 +378,16 @@ only the optimization; the completed model response still succeeds. Aborted,
 failed, or disconnected-before-terminal requests never schedule returns.
 Retained prebuilt decode blocks are not inserted into the decode cache and do
 not publish local KV store events.
+
+With `--fake-output-len-median` set, each answer also has a natural length,
+drawn from a lognormal with that median and `--fake-output-len-sigma`. The
+mean is `median * exp(sigma^2 / 2)`, so median 150 and sigma 1.47 give a mean
+of about 442 tokens. The draw is seeded by the prompt, so the same prompt
+stops at the same token in aggregated and disaggregated serving. A request
+that reaches its natural length finishes with `stop`, the way a real answer
+ends on EOS. One that hits `max_new_tokens` first still finishes with
+`length`. `ignore_eos` turns the natural length off for that request, and
+`min_new_tokens` is a floor under it, as in SGLang.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
@@ -509,11 +565,11 @@ src/sglang/       the shim: SGLang-shaped facade, no simulation logic
 src/fakeengine/   the simulator: scheduler, KV pool, timing, bootstrap,
                     transfer, KV-event policy
 launch/           agg.sh, disagg.sh, agg_kv_router.sh,
-                    cluster.sh (+ clusters/*.yaml)
+                    deployment.sh (+ deployments/*.yaml)
 scripts/          bootstrap_macos.sh, fetch_model_metadata.py
 models/           pinned model metadata (config + tokenizer, no weights)
 tests/            contract tests + simulator behavior + disagg + KV events
-                    + topology + cluster launcher
+                    + topology + deployment launcher
 ```
 
 The split is the point: `src/sglang/` translates, `src/fakeengine/` behaves.

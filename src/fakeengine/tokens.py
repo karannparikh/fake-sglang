@@ -9,6 +9,7 @@ text Dynamo detokenizes is meaningless by construction.
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 from typing import Iterator, List, Sequence
 
@@ -37,6 +38,19 @@ def token_stream(prompt_token_ids: Sequence[int], vocab_size: int) -> Iterator[i
 def take(prompt_token_ids: Sequence[int], vocab_size: int, count: int) -> List[int]:
     stream = token_stream(prompt_token_ids, vocab_size)
     return [next(stream) for _ in range(count)]
+
+
+def natural_length(
+    prompt_token_ids: Sequence[int], median: float, sigma: float
+) -> int:
+    """How many tokens the answer to this prompt has before it would emit EOS.
+
+    Lognormal, which fits chat output lengths: most answers are short and a
+    few run long. Seeded by the prompt, so aggregated and disaggregated
+    serving stop at the same token.
+    """
+    rng = random.Random(seed_for(prompt_token_ids) ^ 0x6F75_746C_656E)
+    return max(1, round(rng.lognormvariate(math.log(median), sigma)))
 
 
 def handoff_token(request_id: str, vocab_size: int) -> int:

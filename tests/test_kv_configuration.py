@@ -339,7 +339,7 @@ def test_generation_cost_does_not_change_decode_or_transfer(server_args):
     assert timing.prefill_ms(1000) == baseline.prefill_ms(1000) + 100
     assert timing.decode_step_ms(4) == baseline.decode_step_ms(4)
     assert timing.transfer_ms(1000) == baseline.transfer_ms(1000)
-    link = Link(name="rack", bandwidth_gb_s=50, latency_ms=0.05)
+    link = Link(name="cluster", bandwidth_gb_s=50, latency_ms=0.05)
     assert timing.transfer_ms(1000, link) == baseline.transfer_ms(1000, link)
 
 

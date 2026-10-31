@@ -1,4 +1,6 @@
 import asyncio
+import random
+import time
 
 import pytest
 
@@ -119,3 +121,68 @@ def test_eviction_preserves_shared_parent_of_other_branches():
     pool.allocate(2)
     assert pool.match_prefix(right) == 2
     assert pool.match_prefix(left) == 1
+
+
+def _naive_victim(pool):
+    """The eviction rule spelled out: the least recently used cached block
+    that nothing references and no cached block names as its parent."""
+    parents = set(pool._parents.values())
+    for digest, block in pool._cached.items():
+        if pool._refcount.get(block, 0) == 0 and digest not in parents:
+            return digest
+    return None
+
+
+def _naive_evictable(pool):
+    return sum(1 for b in pool._cached.values() if pool._refcount.get(b, 0) == 0)
+
+
+def test_eviction_order_and_evictable_count_follow_the_lru_rule():
+    rng = random.Random(7)
+    pool = BlockPool(48, 2)
+    held = []
+    for _ in range(3000):
+        op = rng.random()
+        if op < 0.45:
+            prompt = [rng.randrange(3) for _ in range(2 * rng.randint(1, 6))]
+            hashes = block_hashes(prompt, 2)
+            shared = pool.acquire_prefix(hashes)
+            fresh = pool.allocate(len(hashes) - len(shared))
+            if fresh is None:
+                pool.free(shared)
+                continue
+            pool.insert_prefix(hashes, shared + fresh)
+            held.append(shared + fresh)
+        elif op < 0.85 and held:
+            pool.free(held.pop(rng.randrange(len(held))))
+        elif op < 0.95:
+            pool.match_prefix(block_hashes([rng.randrange(3) for _ in range(6)], 2))
+        else:
+            expected = _naive_victim(pool)
+            removed = []
+            assert pool._evict_one(collect=removed) == (expected is not None)
+            assert removed == ([external_id(expected)] if expected is not None else [])
+        assert pool.evictable_blocks == _naive_evictable(pool)
+        assert pool.used_blocks == pool.num_blocks - len(set(pool._free_clean))
+    for blocks in held:
+        pool.free(blocks)
+    pool.clear_cache()
+    assert pool.cached_blocks == 0 and pool.evictable_blocks == 0 and pool.used_blocks == 0
+
+
+def test_eviction_cost_does_not_grow_with_the_cache():
+    pool = BlockPool(20_000, 4)
+    for i in range(200):
+        hashes = block_hashes([i] * 400, 4)
+        blocks = pool.allocate(len(hashes))
+        pool.insert_prefix(hashes, blocks)
+        pool.free(blocks)
+    started = time.perf_counter()
+    for i in range(100):
+        hashes = block_hashes([10**6 + i] * 400, 4)
+        blocks = pool.allocate(len(hashes))
+        pool.insert_prefix(hashes, blocks)
+        pool.free(blocks)
+        assert pool.can_allocate(1)
+    # 10,000 evictions out of a full 20,000-block cache; a full scan per eviction takes seconds.
+    assert time.perf_counter() - started < 1.0

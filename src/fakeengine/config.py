@@ -59,6 +59,8 @@ class SimConfig:
     location: Optional[str] = None
     topology: Optional[Topology] = None
     kv_generation_ms_per_1k: float = 0.0
+    output_len_median: Optional[float] = None
+    output_len_sigma: float = 1.0
 
     @property
     def total_kv_tokens(self) -> int:
@@ -93,6 +95,15 @@ class SimConfig:
         kv_generation_ms = float(server_args.fake_kv_generation_ms_per_1k_tokens)
         if not math.isfinite(kv_generation_ms) or kv_generation_ms < 0:
             raise ValueError("fake_kv_generation_ms_per_1k_tokens must be finite and nonnegative")
+
+        output_len_median = getattr(server_args, "fake_output_len_median", None)
+        if output_len_median is not None:
+            output_len_median = float(output_len_median)
+            if not math.isfinite(output_len_median) or output_len_median < 1:
+                raise ValueError("fake_output_len_median must be finite and at least 1")
+        output_len_sigma = float(getattr(server_args, "fake_output_len_sigma", 1.0))
+        if not math.isfinite(output_len_sigma) or output_len_sigma < 0:
+            raise ValueError("fake_output_len_sigma must be finite and nonnegative")
 
         max_batched = int(
             server_args.max_prefill_tokens
@@ -265,6 +276,8 @@ class SimConfig:
             prefix_caching=prefix_caching,
             location=location,
             topology=topology,
+            output_len_median=output_len_median,
+            output_len_sigma=output_len_sigma,
         )
 
 
@@ -283,7 +296,7 @@ def announce(config: SimConfig) -> None:
         "mode=%s model=%s vocab=%d kv=%d blocks x %d tok "
         "(%.1f KiB/token) prefill=%.1fms/1k kv-generation=%.1fms/1k "
         "itl=%.1fms xfer=%s speedup=%.2fx "
-        "location=%s",
+        "output-len=%s location=%s",
         config.disaggregation_mode,
         config.served_model_name,
         config.vocab_size,
@@ -297,6 +310,10 @@ def announce(config: SimConfig) -> None:
         if config.topology is not None
         else "%.0fGB/s" % config.kv_bandwidth_gb_s,
         config.speedup_ratio,
+        "max_new_tokens"
+        if config.output_len_median is None
+        else "lognormal(median=%g, sigma=%g)"
+        % (config.output_len_median, config.output_len_sigma),
         config.location or "-",
     )
 

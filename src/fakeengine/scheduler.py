@@ -169,9 +169,10 @@ class Request:
         "_output_reason", "_output_started", "_output_tokens", "_stream",
         "_original_prompt_token_count", "_generated_token_ids",
         "arrival", "blocks", "cache_salt", "cached_tokens", "finished",
-        "first_token", "generated", "max_new_tokens", "observe_cache", "prebuilt",
+        "first_token", "generated", "ignore_eos", "max_new_tokens",
+        "min_new_tokens", "observe_cache", "prebuilt",
         "prefilled", "prompt_ids", "retain_response_kv", "retention_lease",
-        "retention_rejection_reason", "rid",
+        "retention_rejection_reason", "rid", "stop_after",
     )
 
     def __init__(
@@ -185,6 +186,8 @@ class Request:
         cache_salt: Optional[str] = None,
         observe_cache: bool = True,
         retain_response_kv: bool = False,
+        ignore_eos: bool = False,
+        min_new_tokens: int = 0,
     ) -> None:
         if not isinstance(retain_response_kv, bool):
             raise TypeError("retain_response_kv must be a boolean")
@@ -205,6 +208,11 @@ class Request:
         self.arrival = time.monotonic()
         self._cache_observed = False
         self.observe_cache = observe_cache
+        self.ignore_eos = ignore_eos
+        self.min_new_tokens = max(int(min_new_tokens), 0)
+        # Generated-token count at which the answer ends on its own; None
+        # means it only ends at max_new_tokens or the context limit.
+        self.stop_after: Optional[int] = None
         self._output_tokens: list[int] = []
         self._output_ready = 0
         self._output_reason: str | None = None
@@ -386,6 +394,14 @@ class Scheduler:
         if len(request.prompt_ids) > limit:
             raise ValueError(
                 f"Prompt has {len(request.prompt_ids)} tokens; worker capacity is {limit}"
+            )
+        median = self.config.output_len_median
+        if median is not None and not request.ignore_eos and request.stop_after is None:
+            request.stop_after = max(
+                token_gen.natural_length(
+                    request.prompt_ids, median, self.config.output_len_sigma
+                ),
+                request.min_new_tokens,
             )
         self.by_rid[request.rid] = request
         self.waiting.append(request)
@@ -960,10 +976,11 @@ class Scheduler:
                 request._generated_token_ids.append(token)      # noqa: SLF001
 
             finish_reason = None
-            if (
-                len(request.generated) >= request.max_new_tokens
-                or request.total_tokens >= self.config.context_len
-            ):
+            if len(request.generated) >= request.max_new_tokens:
+                finish_reason = FINISH_LENGTH
+            elif self._reached_natural_end(request):
+                finish_reason = FINISH_STOP
+            elif request.total_tokens >= self.config.context_len:
                 finish_reason = FINISH_LENGTH
             if finish_reason is not None:
                 self._complete(request, finish_reason)
@@ -1054,11 +1071,18 @@ class Scheduler:
         # prefill left off instead of repeating it.
         drawn = self._next_token(request)
         token = request.first_token if request.first_token is not None else drawn
-        will_finish = (
-            len(request.generated) + 1 >= request.max_new_tokens
-            or request.total_tokens + 1 >= self.config.context_len
-        )
-        if will_finish:
+        next_generated_count = len(request.generated) + 1
+        finish_reason = None
+        if next_generated_count >= request.max_new_tokens:
+            finish_reason = FINISH_LENGTH
+        elif (
+            request.stop_after is not None
+            and next_generated_count >= request.stop_after
+        ):
+            finish_reason = FINISH_STOP
+        elif request.total_tokens + 1 >= self.config.context_len:
+            finish_reason = FINISH_LENGTH
+        if finish_reason is not None:
             self._prepare_retention_capacity(
                 request,
                 len(request._generated_token_ids) + 1,          # noqa: SLF001
@@ -1066,11 +1090,15 @@ class Scheduler:
         request.generated.append(token)
         if request.retain_response_kv:
             request._generated_token_ids.append(token)          # noqa: SLF001
-        finish_reason = None
-        if len(request.generated) >= request.max_new_tokens:
-            finish_reason = FINISH_LENGTH
+        if finish_reason is not None:
             self._complete(request, finish_reason)
         return RequestOutput(request, (token,), finish_reason)
+
+    @staticmethod
+    def _reached_natural_end(request: Request) -> bool:
+        # Checked after max_new_tokens, as SGLang does: a budget that runs out
+        # on the same token reports "length".
+        return request.stop_after is not None and len(request.generated) >= request.stop_after
 
     def _next_token(self, request: Request) -> int:
         if request._stream is None:                       # noqa: SLF001
@@ -1094,6 +1122,8 @@ class Scheduler:
             request._stream = None                        # noqa: SLF001
             request.prompt_ids = request.prompt_ids + request.generated
             request.max_new_tokens -= len(request.generated)
+            if request.stop_after is not None:
+                request.stop_after -= len(request.generated)
             request.generated = []
             if request.max_new_tokens <= 0:
                 self._finish(request, FINISH_LENGTH)
