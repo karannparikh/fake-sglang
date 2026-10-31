@@ -26,6 +26,10 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from aiohttp import web
 
 from fakeengine.kv_return import (
+    KV_RETURN_FINGERPRINT_LENGTH,
+    KV_RETURN_MAX_IDENTIFIER_LENGTH,
+    KV_RETURN_MAX_INTEGER,
+    KV_RETURN_MAX_METADATA_LENGTH,
     KVReturnAbort,
     KVReturnCommit,
     KVReturnCompatibility,
@@ -128,6 +132,7 @@ class BootstrapServer:
             for manager in self._kv_return_managers.values():
                 manager.abort_all()
             self._room_returns.clear()
+            self._rooms.clear()
 
     async def _sweep_rooms(self) -> None:
         """Drop rooms whose decode peer never came.
@@ -361,7 +366,7 @@ async def _read_control_json(request: web.Request) -> Mapping[str, Any]:
         raise _ControlInputError("request_body_too_large", 413)
     try:
         payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, OverflowError, RecursionError) as exc:
         raise _ControlInputError("malformed_json") from exc
     if not isinstance(payload, dict):
         raise _ControlInputError("request_body_must_be_an_object")
@@ -372,7 +377,15 @@ def _protocol_version(request: web.Request) -> int:
     raw = request.match_info["version"]
     if not raw.isascii() or not raw.isdecimal():
         raise _ControlInputError("protocol_version_must_be_a_nonnegative_integer")
-    return int(raw)
+    try:
+        version = int(raw)
+    except (ValueError, OverflowError) as exc:
+        raise _ControlInputError(
+            "protocol_version_must_be_a_nonnegative_integer"
+        ) from exc
+    if version > KV_RETURN_MAX_INTEGER:
+        raise _ControlInputError("protocol_version_exceeds_protocol_limit")
+    return version
 
 
 def _parse_prepare(value: Any) -> KVReturnPrepare:
@@ -392,7 +405,11 @@ def _parse_prepare(value: Any) -> KVReturnPrepare:
     )
     return KVReturnPrepare(
         ticket=_parse_ticket(payload["ticket"]),
-        attempt_id=_string(payload["attempt_id"], "attempt_id", max_length=256),
+        attempt_id=_string(
+            payload["attempt_id"],
+            "attempt_id",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        ),
         prefill_dp_rank=_integer(
             payload["prefill_dp_rank"], "prefill_dp_rank", minimum=0,
         ),
@@ -401,7 +418,9 @@ def _parse_prepare(value: Any) -> KVReturnPrepare:
             "compatibility_fingerprint",
         ),
         cache_salt=_optional_string(
-            payload["cache_salt"], "cache_salt", max_length=4096,
+            payload["cache_salt"],
+            "cache_salt",
+            max_length=KV_RETURN_MAX_METADATA_LENGTH,
         ),
         generated_token_count=_integer(
             payload["generated_token_count"],
@@ -442,7 +461,11 @@ def _parse_abort(value: Any) -> KVReturnAbort:
     payload = _object(value, "abort", {"ticket", "attempt_id"})
     return KVReturnAbort(
         _parse_ticket(payload["ticket"]),
-        _string(payload["attempt_id"], "attempt_id", max_length=256),
+        _string(
+            payload["attempt_id"],
+            "attempt_id",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        ),
     )
 
 
@@ -462,14 +485,22 @@ def _parse_ticket(value: Any) -> KVReturnTicket:
         },
     )
     return KVReturnTicket(
-        nonce=_string(payload["nonce"], "ticket_nonce", max_length=256),
+        nonce=_string(
+            payload["nonce"],
+            "ticket_nonce",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        ),
         room_id=_integer(payload["room_id"], "ticket_room_id", minimum=0),
         attempt_id=_string(
-            payload["attempt_id"], "ticket_attempt_id", max_length=256,
+            payload["attempt_id"],
+            "ticket_attempt_id",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
         ),
         compatibility=_parse_compatibility(payload["compatibility"]),
         cache_salt=_optional_string(
-            payload["cache_salt"], "ticket_cache_salt", max_length=4096,
+            payload["cache_salt"],
+            "ticket_cache_salt",
+            max_length=KV_RETURN_MAX_METADATA_LENGTH,
         ),
         max_generated_tokens=_integer(
             payload["max_generated_tokens"],
@@ -516,12 +547,12 @@ def _parse_compatibility(value: Any) -> KVReturnCompatibility:
         served_model_name=_string(
             payload["served_model_name"],
             "compatibility_served_model_name",
-            max_length=4096,
+            max_length=KV_RETURN_MAX_METADATA_LENGTH,
         ),
         model_identity=_string(
             payload["model_identity"],
             "compatibility_model_identity",
-            max_length=4096,
+            max_length=KV_RETURN_MAX_METADATA_LENGTH,
         ),
         vocab_size=_integer(
             payload["vocab_size"], "compatibility_vocab_size", minimum=1,
@@ -560,15 +591,22 @@ def _object(
 def _integer(value: Any, name: str, *, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise _ControlInputError(f"{name}_must_be_an_integer_at_least_{minimum}")
+    if value > KV_RETURN_MAX_INTEGER:
+        raise _ControlInputError(f"{name}_exceeds_protocol_limit")
     return value
 
 
 def _finite_number(value: Any, name: str, *, positive: bool) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _ControlInputError(f"{name}_must_be_a_finite_number")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise _ControlInputError(f"{name}_must_be_a_finite_number") from exc
     if not math.isfinite(result) or positive and result <= 0:
         raise _ControlInputError(f"{name}_must_be_finite_and_positive")
+    if result > KV_RETURN_MAX_INTEGER:
+        raise _ControlInputError(f"{name}_exceeds_protocol_limit")
     return result
 
 
@@ -597,7 +635,7 @@ def _optional_string(
 def _hex(value: Any, name: str) -> str:
     if (
         not isinstance(value, str)
-        or len(value) != 32
+        or len(value) != KV_RETURN_FINGERPRINT_LENGTH
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise _ControlInputError(f"{name}_must_be_32_lowercase_hex_characters")

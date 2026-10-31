@@ -1,12 +1,16 @@
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import asyncio
+import json
 
 import aiohttp
+import pytest
 
 from fakeengine.bootstrap import BootstrapServer
 from fakeengine.config import SimConfig
 from fakeengine.kvcache import block_hashes
 from fakeengine.kv_return import (
+    KV_RETURN_MAX_METADATA_LENGTH,
     KVReturnCompatibility,
     KVReturnPrepare,
     KVReturnTicket,
@@ -199,3 +203,230 @@ async def test_disabled_feature_preserves_legacy_room_routes(
     assert "kv_return" not in room
     assert room["first_token"] == 7
     assert scheduler.kv_return._attempts == {}
+
+
+@pytest.mark.parametrize(
+    "body,content_type,version,status,reason",
+    [
+        ("[1,2]", "application/json", 1, 400, "request_body_must_be_an_object"),
+        ('{"ticket":', "application/json", 1, 400, "malformed_json"),
+        ("{}", "text/plain", 1, 400, "content_type_must_be_application_json"),
+        ("{}", "application/json", 2, 400, "prepare_missing_attempt_id"),
+        (
+            "x" * ((1 << 20) + 1),
+            "application/json",
+            1,
+            413,
+            "request_body_too_large",
+        ),
+    ],
+)
+async def test_invalid_request_envelopes_are_typed(
+    server_args,
+    unused_port,
+    body,
+    content_type,
+    version,
+    status,
+    reason,
+):
+    scheduler = _scheduler(server_args)
+    async with _running_server(scheduler, unused_port):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                (
+                    f"http://127.0.0.1:{unused_port}"
+                    f"/kv-return/v{version}/prepare"
+                ),
+                data=body,
+                headers={"Content-Type": content_type},
+            ) as response:
+                payload = await response.json()
+
+    assert response.status == status
+    assert payload["status"] == "invalid_request"
+    assert payload["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    "operation,mutate,status,reason",
+    [
+        (
+            "prepare",
+            lambda prepare, _ticket: {
+                **prepare,
+                "generated_token_count": True,
+            },
+            400,
+            "generated_token_count_must_be_an_integer_at_least_0",
+        ),
+        (
+            "prepare",
+            lambda prepare, _ticket: {**prepare, "session_id": "unknown"},
+            400,
+            "prepare_unknown_session_id",
+        ),
+        (
+            "prepare",
+            lambda prepare, _ticket: {
+                **prepare,
+                "compatibility_fingerprint": "not-a-fingerprint",
+            },
+            400,
+            "compatibility_fingerprint_must_be_32_lowercase_hex_characters",
+        ),
+        (
+            "commit",
+            lambda prepare, ticket: {
+                "prepare": prepare,
+                "generated_token_ids": list(
+                    range(ticket.max_generated_tokens + 1)
+                ),
+            },
+            413,
+            "generated_token_ids_exceed_ticket_limit",
+        ),
+    ],
+)
+async def test_control_fields_are_strictly_validated(
+    server_args,
+    unused_port,
+    operation,
+    mutate,
+    status,
+    reason,
+):
+    scheduler = _scheduler(server_args)
+    _seed(scheduler)
+    async with _running_server(scheduler, unused_port) as server:
+        ticket = _publish(server, scheduler, 40)
+        prepare = asdict(_prepare(ticket))
+        async with aiohttp.ClientSession() as session:
+            response = await _post(
+                session,
+                unused_port,
+                operation,
+                mutate(prepare, ticket),
+            )
+
+    assert response[0] == status
+    assert response[1]["status"] == "invalid_request"
+    assert response[1]["reason"] == reason
+
+
+@pytest.mark.parametrize("case", ["nonce", "rank", "salt", "bytes"])
+async def test_authenticated_controls_cannot_be_substituted(
+    server_args,
+    unused_port,
+    case,
+):
+    scheduler = _scheduler(server_args)
+    _seed(scheduler)
+    async with _running_server(scheduler, unused_port) as server:
+        ticket = _publish(server, scheduler, 50)
+        prepare = _prepare(ticket)
+        if case == "nonce":
+            prepare = replace(
+                prepare,
+                ticket=replace(ticket, nonce="u" * 32),
+            )
+        elif case == "rank":
+            compatibility = replace(
+                ticket.compatibility,
+                prefill_dp_rank=1,
+            )
+            changed = replace(ticket, compatibility=compatibility)
+            prepare = replace(
+                prepare,
+                ticket=changed,
+                prefill_dp_rank=1,
+                compatibility_fingerprint=compatibility.fingerprint,
+            )
+        elif case == "salt":
+            prepare = replace(prepare, cache_salt="other-tenant")
+        else:
+            prepare = replace(
+                prepare,
+                claimed_payload_bytes=prepare.claimed_payload_bytes + 1,
+            )
+        async with aiohttp.ClientSession() as session:
+            status, payload = await _post(
+                session,
+                unused_port,
+                "prepare",
+                asdict(prepare),
+            )
+
+    assert status in {404, 409}
+    assert payload["status"] in {"not_found", "incompatible"}
+
+
+async def test_room_cleanup_releases_active_and_terminal_state(
+    server_args,
+    unused_port,
+):
+    scheduler = _scheduler(server_args)
+    _seed(scheduler)
+    server = BootstrapServer(
+        "127.0.0.1",
+        unused_port,
+        room_ttl_s=0.04,
+        kv_return_managers=[scheduler.kv_return],
+    )
+    await server.start()
+    active = _publish(server, scheduler, 60)
+    terminal = _publish(server, scheduler, 61)
+    async with aiohttp.ClientSession() as session:
+        await _post(session, unused_port, "abort", {
+            "ticket": asdict(terminal),
+            "attempt_id": terminal.attempt_id,
+        })
+    await asyncio.sleep(0.12)
+    assert active.nonce not in scheduler.kv_return._attempts
+    await server.stop()
+
+    assert scheduler.kv_return._attempts == {}
+    assert scheduler.kv_return._terminal == {}
+    assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
+
+
+async def test_protocol_limits_are_enforced_before_manager_dispatch(
+    server_args,
+    unused_port,
+):
+    scheduler = _scheduler(server_args)
+    _seed(scheduler)
+    async with _running_server(scheduler, unused_port) as server:
+        ticket = _publish(server, scheduler, 70)
+        prepare = asdict(_prepare(ticket))
+        raw = json.dumps(prepare).replace(
+            '"deadline_ms": 500.0',
+            f'"deadline_ms": {"9" * 400}',
+            1,
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://127.0.0.1:{unused_port}/kv-return/v1/prepare",
+                data=raw,
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                payload = response.status, await response.json()
+
+    assert payload[0] == 400
+    assert payload[1]["status"] == "invalid_request"
+
+    oversized = "x" * (KV_RETURN_MAX_METADATA_LENGTH + 1)
+    server = BootstrapServer(
+        "127.0.0.1",
+        1,
+        kv_return_managers=[scheduler.kv_return],
+    )
+    server.publish_room(
+        71,
+        num_tokens=4,
+        kv_bytes=64,
+        prefill_dp_rank=0,
+        kv_return_prompt_ids=(1, 2, 3, 4),
+        kv_return_cache_salt=oversized,
+    )
+    assert "kv_return" not in server._rooms[71]
