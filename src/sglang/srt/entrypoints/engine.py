@@ -18,6 +18,7 @@ backend, chiefly:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 from contextlib import AsyncExitStack, ExitStack, aclosing
 from itertools import count
@@ -30,16 +31,50 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 from fakeengine import tokens as token_gen
-from fakeengine.bootstrap import BootstrapClient, BootstrapServer
+from fakeengine.bootstrap import (
+    BootstrapClient,
+    BootstrapServer,
+    KVReturnProtocolError,
+    KVReturnTransportError,
+)
 from fakeengine.cache_metrics import PrefixCacheMetrics
 from fakeengine.config import SimConfig, announce
 from fakeengine.fpm import ForwardPassPublisher
 from fakeengine.kv_events import build_emitter
-from fakeengine.scheduler import Request, Scheduler
+from fakeengine.kv_return_client import (
+    KVReturnAttemptContext,
+    KVReturnLeaseLostError,
+    KVReturnOutcome,
+    KVReturnOutcomeStatus,
+    return_generated_kv,
+    validate_kv_return_attempt,
+    validate_kv_return_generated,
+)
+from fakeengine.scheduler import (
+    KVRetentionClaim,
+    KVRetentionLease,
+    Request,
+    Scheduler,
+)
 from fakeengine.stats import MetricsPusher
 from fakeengine.transfer import KVReceiver, KVSender
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _BackgroundKVReturn:
+    scheduler: Scheduler
+    claim: KVRetentionClaim
+    attempt: KVReturnAttemptContext
+    host: str
+    port: int
+    start: asyncio.Event
+    finished: bool = False
+
+    @property
+    def lease(self) -> KVRetentionLease:
+        return self.claim.lease
 
 
 class _SchedulerInitResult:
@@ -96,7 +131,6 @@ class TokenizerManager:
             cache_salt=getattr(obj, "cache_salt", None),
             routed_dp_rank=getattr(obj, "routed_dp_rank", None),
             data_parallel_rank=getattr(obj, "data_parallel_rank", None),
-            retain_response_kv=getattr(obj, "retain_response_kv", False),
         )
         async with aclosing(stream):
             async for chunk in stream:
@@ -272,6 +306,11 @@ class Engine:
                 self.sim_config.max_running_requests,
             )
         self._bootstrap_ready: Optional[asyncio.Task] = None
+        self._kv_return_tasks: Dict[
+            asyncio.Task,
+            _BackgroundKVReturn,
+        ] = {}
+        self._kv_return_sleep = asyncio.sleep
         self._started = False
         self._shutdown = False
 
@@ -328,6 +367,7 @@ class Engine:
 
     async def _async_shutdown(self) -> None:
         self._shutdown = True
+        await self._shutdown_kv_returns()
         # Unwind every resource even if an earlier task failed.
         async with AsyncExitStack() as cleanup:
             if self._bootstrap_server is not None:
@@ -563,6 +603,12 @@ class Engine:
         handoff = metadata.get("first_token")
         if handoff is None:
             handoff = token_gen.handoff_token(request_id, self.sim_config.vocab_size)
+        attempt = self._return_attempt(
+            scheduler,
+            receiver,
+            metadata,
+            cache_salt,
+        )
         request = Request(
             request_id,
             prompt_ids,
@@ -572,22 +618,314 @@ class Engine:
             cache_salt=cache_salt,
             ignore_eos=ignore_eos,
             min_new_tokens=min_new_tokens,
-            retain_response_kv=retain_response_kv,
+            retain_response_kv=attempt is not None or retain_response_kv,
         )
         scheduler.submit(request)
         terminal_delivered = False
+        scheduled: Optional[_BackgroundKVReturn] = None
         try:
             async for chunk in self._drain(request, started):
-                if chunk["meta_info"]["finish_reason"] is not None:
+                terminal = chunk["meta_info"]["finish_reason"] is not None
+                if terminal and attempt is not None:
+                    lease = request.retention_lease
+                    if lease is not None:
+                        scheduled = self._schedule_kv_return(
+                            scheduler,
+                            lease,
+                            attempt,
+                            receiver.host,
+                            receiver.port,
+                        )
+                        if scheduled is not None:
+                            chunk["meta_info"]["kv_return"] = {
+                                "status": "scheduled",
+                                "num_tokens": lease.generated_token_count,
+                                "kv_bytes": (
+                                    lease.generated_token_count
+                                    * self.sim_config.kv_return_bytes_per_token
+                                ),
+                            }
+                    elif request.retention_rejection_reason is not None:
+                        scheduler.record_kv_return_rejected(
+                            "retention_" + request.retention_rejection_reason
+                        )
+                if terminal:
                     terminal_delivered = True
                 yield chunk
+                if terminal and scheduled is not None:
+                    scheduled.start.set()
         finally:
             scheduler.abort(request_id)
-            if request.retention_lease is not None and not terminal_delivered:
+            if scheduled is not None and terminal_delivered:
+                # ``aclose`` immediately after receiving the terminal chunk
+                # enters this path before the generator resumes after yield.
+                scheduled.start.set()
+            elif (
+                request.retention_lease is not None
+                and (not terminal_delivered or attempt is not None)
+            ):
                 scheduler.release_retention(
                     request.retention_lease,
-                    reason="undelivered",
+                    reason=(
+                        "undelivered"
+                        if not terminal_delivered
+                        else "unscheduled"
+                    ),
                 )
+
+    def _return_attempt(
+        self,
+        scheduler: Scheduler,
+        receiver: KVReceiver,
+        metadata: Dict[str, Any],
+        cache_salt: Optional[str],
+    ) -> Optional[KVReturnAttemptContext]:
+        if not (
+            self.disaggregation_mode == "decode"
+            and self.sim_config.enable_kv_return
+            and self.sim_config.prefix_caching
+            and not receiver.is_fake_host
+            and metadata.get("kv_return") is not None
+        ):
+            return None
+        try:
+            return validate_kv_return_attempt(
+                self.sim_config,
+                metadata,
+                cache_salt=cache_salt,
+            )
+        except KVReturnProtocolError as exc:
+            scheduler.record_kv_return_rejected("invalid_ticket")
+            logger.debug(
+                "fake-sglang: response KV return ticket rejected (%s)",
+                type(exc).__name__,
+            )
+            return None
+
+    def _schedule_kv_return(
+        self,
+        scheduler: Scheduler,
+        lease: KVRetentionLease,
+        attempt: KVReturnAttemptContext,
+        host: str,
+        port: int,
+    ) -> Optional[_BackgroundKVReturn]:
+        if self._shutdown:
+            scheduler.record_kv_return_rejected("shutdown")
+            scheduler.release_retention(lease, reason="shutdown")
+            return None
+        try:
+            validate_kv_return_generated(
+                self.sim_config,
+                attempt,
+                lease.generated_token_ids,
+            )
+        except KVReturnProtocolError:
+            scheduler.record_kv_return_rejected("invalid_payload")
+            scheduler.release_retention(lease, reason="invalid_payload")
+            return None
+        task_limit = min(
+            scheduler.config.max_running_requests,
+            scheduler.config.kv_return_retention_max_leases,
+        )
+        active = sum(
+            not task.done() and state.scheduler is scheduler
+            for task, state in self._kv_return_tasks.items()
+        )
+        if active >= task_limit:
+            scheduler.record_kv_return_rejected("task_limit")
+            scheduler.release_retention(lease, reason="task_limit")
+            return None
+
+        claim = scheduler.claim_retention(lease)
+        if claim is None:
+            scheduler.record_kv_return_rejected("lease_unavailable")
+            return None
+        state = _BackgroundKVReturn(
+            scheduler,
+            claim,
+            attempt,
+            host,
+            port,
+            asyncio.Event(),
+        )
+        coroutine = self._run_kv_return(state)
+        try:
+            task = asyncio.get_running_loop().create_task(coroutine)
+        except Exception:
+            coroutine.close()
+            scheduler.record_kv_return_rejected("task_creation")
+            scheduler.release_retention(
+                lease,
+                claim=claim,
+                reason="task_creation",
+            )
+            return None
+        self._kv_return_tasks[task] = state
+        scheduler.record_kv_return_attempt()
+        task.add_done_callback(self._kv_return_done)
+        return state
+
+    async def _run_kv_return(
+        self,
+        state: _BackgroundKVReturn,
+    ) -> None:
+        scheduler = state.scheduler
+        release_reason = "failed"
+        assert self._bootstrap_client is not None
+        try:
+            remaining = state.claim.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "KV return task deadline expired before start"
+                )
+            try:
+                await asyncio.wait_for(
+                    state.start.wait(),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "KV return task deadline expired before start"
+                ) from exc
+            outcome = await return_generated_kv(
+                self.sim_config,
+                self._bootstrap_client,
+                host=state.host,
+                port=state.port,
+                room_metadata={},
+                generated_token_ids=state.lease.generated_token_ids,
+                attempt=state.attempt,
+                sleep=self._kv_return_sleep,
+                task_deadline=state.claim.deadline,
+                owns_source=lambda: scheduler.owns_retention_claim(
+                    state.claim
+                ),
+            )
+            if not scheduler.owns_retention_claim(state.claim):
+                raise KVReturnLeaseLostError(
+                    "retained response KV lease ownership was lost"
+                )
+            release_reason = outcome.status.value
+            self._record_kv_return_outcome(scheduler, outcome)
+        except asyncio.CancelledError:
+            scheduler.record_kv_return_failed("cancelled")
+            release_reason = "cancelled"
+            raise
+        except TimeoutError as exc:
+            reason = self._kv_return_timeout_reason(exc)
+            scheduler.record_kv_return_failed(reason)
+            release_reason = reason
+            logger.debug(
+                "fake-sglang: response KV return timed out (%s)",
+                reason,
+            )
+        except KVReturnTransportError:
+            scheduler.record_kv_return_failed("transport")
+            release_reason = "transport"
+            logger.warning(
+                "fake-sglang: response KV return transport failed"
+            )
+        except KVReturnLeaseLostError:
+            scheduler.record_kv_return_failed("lease_lost")
+            release_reason = "lease_lost"
+            logger.warning(
+                "fake-sglang: response KV return lease ownership lost"
+            )
+        except KVReturnProtocolError:
+            scheduler.record_kv_return_failed("protocol")
+            release_reason = "protocol"
+            logger.warning(
+                "fake-sglang: response KV return protocol failed"
+            )
+        except Exception as exc:  # noqa: BLE001 - response is already complete
+            scheduler.record_kv_return_failed("unexpected")
+            release_reason = "unexpected"
+            logger.warning(
+                "fake-sglang: response KV return failed (%s)",
+                type(exc).__name__,
+            )
+        finally:
+            scheduler.release_retention(
+                state.lease,
+                claim=state.claim,
+                reason=release_reason,
+            )
+            scheduler.record_kv_return_task_finished()
+            state.finished = True
+
+    @staticmethod
+    def _record_kv_return_outcome(
+        scheduler: Scheduler,
+        outcome: KVReturnOutcome,
+    ) -> None:
+        if outcome.status == KVReturnOutcomeStatus.COMMITTED:
+            scheduler.record_kv_return_stored(
+                tokens=outcome.generated_token_count,
+                payload_bytes=outcome.payload_bytes,
+                transfer_ms=outcome.transfer_ms,
+                commit_ms=outcome.commit_ms,
+            )
+            return
+        response = (
+            outcome.prepare_response
+            if outcome.status == KVReturnOutcomeStatus.PREPARE_REJECTED
+            else outcome.commit_response
+        )
+        assert response is not None
+        phase = (
+            "prepare"
+            if outcome.status == KVReturnOutcomeStatus.PREPARE_REJECTED
+            else "commit"
+        )
+        scheduler.record_kv_return_rejected(
+            f"{phase}_{response.status.value}"
+        )
+
+    @staticmethod
+    def _kv_return_timeout_reason(exc: TimeoutError) -> str:
+        detail = str(exc).lower()
+        if "prepare" in detail:
+            return "prepare_timeout"
+        if "transfer" in detail:
+            return "transfer_timeout"
+        if "commit" in detail:
+            return "commit_timeout"
+        return "deadline_timeout"
+
+    def _kv_return_done(self, task: asyncio.Task) -> None:
+        state = self._kv_return_tasks.pop(task, None)
+        if state is None:
+            return
+        if not state.finished:
+            state.scheduler.record_kv_return_failed("cancelled")
+            state.scheduler.release_retention(
+                state.lease,
+                claim=state.claim,
+                reason="cancelled",
+            )
+            state.scheduler.record_kv_return_task_finished()
+            state.finished = True
+        if not task.cancelled():
+            task.exception()
+
+    async def _shutdown_kv_returns(self) -> None:
+        tasks = list(self._kv_return_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            state = self._kv_return_tasks.pop(task, None)
+            if state is not None and not state.finished:
+                state.scheduler.record_kv_return_failed("cancelled")
+                state.scheduler.release_retention(
+                    state.lease,
+                    claim=state.claim,
+                    reason="cancelled",
+                )
+                state.scheduler.record_kv_return_task_finished()
+                state.finished = True
 
     async def _drain(self, request: Request, started: float) -> AsyncIterator[dict]:
         """Turn separated per-request outputs into SGLang response chunks."""

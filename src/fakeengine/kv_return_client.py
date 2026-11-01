@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+from enum import Enum
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Protocol
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from fakeengine.bootstrap import (
     KVReturnControlResponse,
@@ -31,6 +39,10 @@ from fakeengine.timing import TimingModel
 from fakeengine.topology import Link
 
 logger = logging.getLogger(__name__)
+
+
+class KVReturnLeaseLostError(RuntimeError):
+    """The decode task no longer owns the retained source KV."""
 
 
 class KVReturnControlClient(Protocol):
@@ -79,10 +91,33 @@ class KVReturnOutcome:
     attempt_id: str
     generated_token_count: int
     payload_bytes: int
+    prepare_ms: float
     transfer_ms: float
-    link: str | None
+    commit_ms: float
+    link: Optional[str]
     prepare_response: KVReturnControlResponse
-    commit_response: KVReturnControlResponse | None = None
+    commit_response: Optional[KVReturnControlResponse] = None
+
+
+@dataclass(frozen=True)
+class KVReturnAttemptContext:
+    ticket: KVReturnTicket
+    prefill_location: Optional[str]
+
+
+def validate_kv_return_attempt(
+    config: SimConfig,
+    room_metadata: Mapping[str, Any],
+    *,
+    cache_salt: Optional[str],
+) -> KVReturnAttemptContext:
+    """Validate the forward-room ticket before decode retains response KV."""
+    ticket, prefill_location = _validate_ticket(config, room_metadata)
+    if ticket.cache_salt != (cache_salt or None):
+        raise KVReturnProtocolError(
+            "KV return ticket cache salt does not match the decode request"
+        )
+    return KVReturnAttemptContext(ticket, prefill_location)
 
 
 async def return_generated_kv(
@@ -93,21 +128,38 @@ async def return_generated_kv(
     port: int,
     room_metadata: Mapping[str, Any],
     generated_token_ids: Sequence[int],
-    cache_salt: str | None = None,
+    cache_salt: Optional[str] = None,
+    attempt: Optional[KVReturnAttemptContext] = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    task_deadline: Optional[float] = None,
+    owns_source: Optional[Callable[[], bool]] = None,
 ) -> KVReturnOutcome:
     """Prepare, simulate generated-KV transfer, and commit one exact ticket."""
     started_at = time.monotonic()
-    ticket, generated, prefill_location = _validate_operation(
+    context = attempt or validate_kv_return_attempt(
         config,
         room_metadata,
-        generated_token_ids,
         cache_salt=cache_salt,
+    )
+    ticket = context.ticket
+    generated = validate_kv_return_generated(
+        config, context, generated_token_ids,
     )
     deadline = started_at + min(
         client.timeout_s,
         _ticket_budget_s(ticket),
     )
+    if task_deadline is not None:
+        if (
+            isinstance(task_deadline, bool)
+            or not isinstance(task_deadline, (int, float))
+            or not math.isfinite(task_deadline)
+        ):
+            raise KVReturnProtocolError(
+                "KV return task deadline must be a finite monotonic timestamp"
+            )
+        deadline = min(deadline, float(task_deadline))
+    _require_source_ownership(owns_source)
     if deadline <= time.monotonic():
         raise TimeoutError("KV return ticket expired before prepare")
 
@@ -123,6 +175,7 @@ async def return_generated_kv(
         ),
         token_ids_checksum=kv_return_checksum(ticket, generated),
     )
+    prepare_started = time.monotonic()
     try:
         prepared = await client.prepare_kv_return(
             host,
@@ -133,17 +186,25 @@ async def return_generated_kv(
     except BaseException:
         await _best_effort_abort(client, host, port, ticket)
         raise
+    prepare_ms = (time.monotonic() - prepare_started) * 1000.0
     payload_bytes = prepare.claimed_payload_bytes
     if (
         prepared.status == KVReturnControlStatus.COMMITTED
         and prepared.idempotent
     ):
+        try:
+            _require_source_ownership(owns_source)
+        except BaseException:
+            await _best_effort_abort(client, host, port, ticket)
+            raise
         return KVReturnOutcome(
             status=KVReturnOutcomeStatus.COMMITTED,
             attempt_id=ticket.attempt_id,
             generated_token_count=len(generated),
             payload_bytes=payload_bytes,
+            prepare_ms=prepare_ms,
             transfer_ms=0.0,
+            commit_ms=0.0,
             link=None,
             prepare_response=prepared,
         )
@@ -153,13 +214,16 @@ async def return_generated_kv(
             attempt_id=ticket.attempt_id,
             generated_token_count=len(generated),
             payload_bytes=payload_bytes,
+            prepare_ms=prepare_ms,
             transfer_ms=0.0,
+            commit_ms=0.0,
             link=None,
             prepare_response=prepared,
         )
 
     try:
-        link = _reverse_link(config, prefill_location)
+        _require_source_ownership(owns_source)
+        link = _reverse_link(config, context.prefill_location)
         transfer_ms = TimingModel(config).kv_return_transfer_ms(
             len(generated),
             link,
@@ -186,15 +250,19 @@ async def return_generated_kv(
                 ) from exc
         if time.monotonic() >= deadline:
             raise TimeoutError("KV return deadline expired before commit")
+        _require_source_ownership(owns_source)
+        commit_started = time.monotonic()
         committed = await client.commit_kv_return(
             host,
             port,
             KVReturnCommit(prepare, generated),
             deadline=deadline,
         )
+        _require_source_ownership(owns_source)
     except BaseException:
         await _best_effort_abort(client, host, port, ticket)
         raise
+    commit_ms = (time.monotonic() - commit_started) * 1000.0
 
     if committed.status != KVReturnControlStatus.COMMITTED:
         await _best_effort_abort(client, host, port, ticket)
@@ -203,7 +271,9 @@ async def return_generated_kv(
             attempt_id=ticket.attempt_id,
             generated_token_count=len(generated),
             payload_bytes=payload_bytes,
+            prepare_ms=prepare_ms,
             transfer_ms=transfer_ms,
+            commit_ms=commit_ms,
             link=link.name if link is not None else None,
             prepare_response=prepared,
             commit_response=committed,
@@ -213,20 +283,19 @@ async def return_generated_kv(
         attempt_id=ticket.attempt_id,
         generated_token_count=len(generated),
         payload_bytes=payload_bytes,
+        prepare_ms=prepare_ms,
         transfer_ms=transfer_ms,
+        commit_ms=commit_ms,
         link=link.name if link is not None else None,
         prepare_response=prepared,
         commit_response=committed,
     )
 
 
-def _validate_operation(
+def _validate_ticket(
     config: SimConfig,
     room_metadata: Mapping[str, Any],
-    generated_token_ids: Sequence[int],
-    *,
-    cache_salt: str | None,
-) -> tuple[KVReturnTicket, tuple[int, ...], str | None]:
+) -> Tuple[KVReturnTicket, Optional[str]]:
     if not isinstance(room_metadata, Mapping):
         raise KVReturnProtocolError("room metadata must be an object")
     if not config.enable_kv_return or config.disaggregation_mode != "decode":
@@ -236,10 +305,6 @@ def _validate_operation(
     if "kv_return" not in room_metadata:
         raise KVReturnProtocolError("room metadata has no kv_return ticket")
     ticket = parse_kv_return_ticket(room_metadata["kv_return"])
-    if ticket.cache_salt != (cache_salt or None):
-        raise KVReturnProtocolError(
-            "KV return ticket cache salt does not match the decode request"
-        )
     local = kv_return_compatibility(
         config,
         ticket.compatibility.prefill_dp_rank,
@@ -270,6 +335,23 @@ def _validate_operation(
             "KV return ticket payload limits are inconsistent"
         )
 
+    prefill_location = room_metadata.get("location")
+    if prefill_location is not None and (
+        not isinstance(prefill_location, str) or not prefill_location
+    ):
+        raise KVReturnProtocolError(
+            "prefill location must be null or a nonempty string"
+        )
+    return ticket, prefill_location
+
+
+def validate_kv_return_generated(
+    config: SimConfig,
+    attempt: KVReturnAttemptContext,
+    generated_token_ids: Sequence[int],
+) -> Tuple[int, ...]:
+    """Validate a retained response against its immutable attempt context."""
+    ticket = attempt.ticket
     try:
         generated = tuple(generated_token_ids)
     except TypeError as exc:
@@ -294,15 +376,16 @@ def _validate_operation(
         raise KVReturnProtocolError(
             "generated KV payload exceeds the KV return ticket"
         )
+    return generated
 
-    prefill_location = room_metadata.get("location")
-    if prefill_location is not None and (
-        not isinstance(prefill_location, str) or not prefill_location
-    ):
-        raise KVReturnProtocolError(
-            "prefill location must be null or a nonempty string"
+
+def _require_source_ownership(
+    owns_source: Optional[Callable[[], bool]],
+) -> None:
+    if owns_source is not None and not owns_source():
+        raise KVReturnLeaseLostError(
+            "retained response KV lease ownership was lost"
         )
-    return ticket, generated, prefill_location
 
 
 def _ticket_budget_s(ticket: KVReturnTicket) -> float:

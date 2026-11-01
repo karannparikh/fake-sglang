@@ -229,6 +229,10 @@ class BootstrapServer:
         kv_return_prompt_ids: Sequence[int] | None = None,
         kv_return_cache_salt: str | None = None,
     ) -> None:
+        """Publish prefill metadata and an optional KV-return capability ticket.
+
+        A ``None`` ticket means reverse KV transfer is unavailable for this room.
+        """
         # ``first_token`` is prefill's real output. SGLang hands the same value
         # to decode through its metadata buffer rather than the KV payload
         # (``disaggregation/decode.py::_commit_transfer_to_req``); carrying it
@@ -242,6 +246,7 @@ class BootstrapServer:
             "kv_bytes": int(kv_bytes),
             "first_token": first_token,
             "location": location,
+            "kv_return": None,
             "ready_ts": time.time(),
         }
         if prefill_dp_rank is not None and kv_return_prompt_ids is not None:

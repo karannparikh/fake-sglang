@@ -433,7 +433,7 @@ def test_unparseable_ticket_fields_are_rejected_before_publication(
         ),
     )
 
-    assert "kv_return" not in server._rooms[113]
+    assert server._rooms[113]["kv_return"] is None
     assert scheduler.kv_return._attempts == {}
 
 
@@ -773,6 +773,7 @@ async def test_disabled_feature_and_legacy_routes_are_unchanged(
         "kv_bytes": 64,
         "first_token": 7,
         "location": None,
+        "kv_return": None,
     }
     assert scheduler.kv_return._attempts == {}
     assert events.stored == events.removed == []
