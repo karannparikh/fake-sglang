@@ -242,6 +242,8 @@ def test_engine_metrics_export_through_multiprocess_collector():
                 engine.scheduler.record_kv_return_attempt()
                 engine.scheduler.record_kv_return_rejected("task_limit")
                 engine.scheduler.record_kv_return_failed("transport")
+                engine.scheduler.record_kv_return_claim_delay(0.25, "claimed")
+                engine.scheduler.record_kv_return_claim_delay(35, "expired")
                 engine.scheduler.record_kv_return_stored(
                     tokens=4,
                     payload_bytes=128,
@@ -263,6 +265,22 @@ def test_engine_metrics_export_through_multiprocess_collector():
                 assert value(return_prefix + "bytes_total") == 128
                 assert value(return_prefix + "transfer_seconds_total") == 0.007
                 assert value(return_prefix + "commit_seconds_total") == 0.003
+                assert value(
+                    return_prefix + "claim_delay_seconds_count",
+                    {"result": "claimed"},
+                ) == 1
+                assert value(
+                    return_prefix + "claim_delay_seconds_sum",
+                    {"result": "claimed"},
+                ) == 0.25
+                assert value(
+                    return_prefix + "claim_delay_seconds_count",
+                    {"result": "expired"},
+                ) == 1
+                assert value(
+                    return_prefix + "claim_delay_seconds_sum",
+                    {"result": "expired"},
+                ) == 35
                 assert value(return_prefix + "active_tasks") == 0
             finally:
                 await engine._async_shutdown()

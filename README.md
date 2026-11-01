@@ -75,8 +75,11 @@ without counting another cache observation.
 Enabled response return adds bounded `sglang:simulated_kv_return_` metrics for
 accepted attempts, stored responses, rejected and failed attempts by stable
 reason, returned tokens/bytes, transfer and commit time, active tasks, and
-retained blocks. The scheduler's KV occupancy and retention lease counters
-remain the source of truth; these metrics only report orchestration outcomes.
+retained blocks. `simulated_kv_return_claim_delay_seconds` measures from
+completed response generation to the retention-claim attempt and labels each
+observation as claimed, expired, released, already claimed, not registered, or
+invalid owner. The scheduler's KV occupancy and retention lease counters remain
+the source of truth; these metrics only report orchestration outcomes.
 
 `--enable-forward-pass-metrics` requires Dynamo's injected
 `--forward-pass-metrics-ipc-name` and `--forward-pass-metrics-worker-id`.
@@ -314,16 +317,17 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-itl-ms-per-running-req` | 0.35 | ITL added per extra request in the batch |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
-| `--enable-kv-return` | false | Enable version-1 best-effort response-KV return on eligible prefill and decode workers |
-| `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return ticket accepts |
-| `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Return-ticket deadline in milliseconds |
+| `--enable-kv-return` | false | Enable version-2 best-effort response-KV return on eligible prefill and decode workers |
+| `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return handle accepts |
+| `--fake-kv-return-handle-timeout-ms` | max(bootstrap timeout x 4000, 60000) | Lifetime of the handoff handle carried through decode |
+| `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Lifetime of the transfer ticket minted after prepare |
 | `--fake-kv-return-bytes-per-token` | model-derived forward value | Reverse-transfer payload bytes per generated token |
 | `--fake-kv-return-bandwidth-gb-s` | forward KV bandwidth | Reverse-transfer bandwidth override |
 | `--fake-kv-return-overhead-ms` | forward transfer overhead | Fixed reverse-transfer overhead override |
 | `--fake-kv-return-retention-max-leases` | 32 | Maximum completed decode responses whose KV may remain retained |
 | `--fake-kv-return-retention-max-blocks` | all worker blocks | Maximum blocks held by completed-response retention leases |
 | `--fake-kv-return-retention-max-bytes` | retention block budget x block bytes | Maximum KV bytes held by completed-response retention leases |
-| `--fake-kv-return-retention-timeout-ms` | return-ticket deadline | Time before an unreleased completed-response lease expires |
+| `--fake-kv-return-retention-timeout-ms` | transfer-ticket deadline | Time before an unreleased completed-response lease expires |
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
@@ -357,7 +361,7 @@ ends on EOS. One that hits `max_new_tokens` first still finishes with
 `length`. `ignore_eos` turns the natural length off for that request, and
 `min_new_tokens` is a floor under it, as in SGLang.
 
-KV return limits, deadlines, bandwidth and byte-size overrides must be finite
+KV return limits, handle/transfer deadlines, bandwidth and byte-size overrides must be finite
 and positive; token limits and byte sizes must also be integers. Transfer
 overheads must be finite and nonnegative, so zero remains valid for both
 forward and reverse transfers. The bootstrap timeout must be finite and
@@ -369,7 +373,7 @@ existing forward-transfer or model-derived values.
 
 Eligible normal decode completion now uses the existing typed retention lease
 automatically. Eligibility requires decode mode, local `--enable-kv-return`,
-radix caching, a real peer, and a valid server-issued room ticket whose
+radix caching, a real peer, and a valid server-issued room handle whose
 compatibility, prefill rank, room, and `cache_salt` match the decode request.
 No ticket is inferred from a request or session ID. For block size `B`, prompt
 length `P`, and generated length `G`, the lease owns block indices
@@ -442,27 +446,30 @@ requests never publish `kv_return` metadata.
 `--enable-kv-return` is disabled by default and must be enabled on both
 workers. On a real disaggregated prefill room with radix caching enabled, the
 bootstrap server asks that rank's return manager to issue the `kv_return`
-ticket placed in room metadata. The ticket has an unguessable nonce and
-attempt ID, exact room and prefill DP rank, cache namespace,
-token/byte/deadline limits, and the complete model/KV compatibility contract.
-No session ID is used.
+handle placed in room metadata. The handle has an unguessable nonce and
+attempt ID, exact room and prefill DP rank, cache namespace, token/byte limits,
+its own bounded lifetime, and the complete model/KV compatibility contract.
+It does not spend the transfer deadline while decode generates tokens. No
+session ID is used.
 
 The prefill bootstrap HTTP server exposes the manager lifecycle directly:
 
 ```
-POST /kv-return/v1/prepare  -> READY only after clean capacity is reserved
-POST /kv-return/v1/commit   -> atomically imports the validated token tail
-POST /kv-return/v1/abort    -> releases an issued or prepared attempt
+POST /kv-return/v2/prepare  -> reserves clean capacity and returns a fresh transfer ticket
+POST /kv-return/v2/commit   -> validates that ticket and atomically imports the token tail
+POST /kv-return/v2/abort    -> releases an issued or prepared attempt
 ```
 
-Each operation carries the complete ticket and attempt controls. JSON fields
-and types are strict, request and token-array sizes are bounded, and stable
-status/reason bodies distinguish malformed input, missing or expired tickets,
+Prepare carries the complete handoff handle and exact generated-token controls.
+Its success response mints a nonce-bound, short-lived transfer ticket; commit
+must present that exact ticket with the token payload. JSON fields and types
+are strict, request and token-array sizes are bounded, and stable status/reason
+bodies distinguish malformed input, missing or expired handles/tickets,
 compatibility mismatch, capacity rejection, checksum/token failure and import
 failure. Exact duplicate requests preserve the manager's idempotent result.
 The existing bootstrap sweeper expires manager attempts; an unclaimed room's
-expiry clears its active or terminal ticket state, and server shutdown releases
-all reservations and idempotency records.
+expiry clears its active or terminal state, and server shutdown releases all
+reservations and idempotency records.
 
 `BootstrapClient` now has strict typed prepare, commit, and abort operations,
 and `fakeengine.kv_return_client.return_generated_kv` can execute one explicit

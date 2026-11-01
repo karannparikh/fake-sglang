@@ -13,7 +13,7 @@ from fakeengine.topology import Topology, load as load_topology
 logger = logging.getLogger(__name__)
 
 _BANNER_SHOWN = False
-KV_RETURN_PROTOCOL_VERSION = 1
+KV_RETURN_PROTOCOL_VERSION = 2
 
 
 @dataclass
@@ -40,7 +40,8 @@ class SimConfig:
     enable_kv_return: bool  # Advertise reverse-KV return on eligible rooms.
     kv_return_protocol_version: int  # Version of the return-ticket schema.
     kv_return_max_tokens: int  # Maximum generated tokens a ticket accepts.
-    kv_return_deadline_ms: float  # Return-ticket deadline in milliseconds.
+    kv_return_handle_timeout_ms: float  # Handoff-handle lifetime.
+    kv_return_deadline_ms: float  # Prepared transfer-ticket lifetime.
     kv_return_bytes_per_token: int  # Reverse payload bytes per generated token.
     kv_return_bandwidth_gb_s: float  # Simulated reverse-transfer bandwidth.
     kv_return_overhead_ms: float  # Fixed reverse-transfer cost in milliseconds.
@@ -180,9 +181,10 @@ class SimConfig:
                 "fake_kv_return_deadline_ms",
             )
         # A zero bootstrap timeout is a legitimate forward-path configuration,
-        # but it collapses the fallback reverse-return deadline to zero. Only
-        # an eligible reverse path actually uses that deadline, so validate the
-        # effective value there rather than forbidding a zero forward timeout.
+        # but it collapses the fallback prepared-transfer deadline to zero.
+        # Only an eligible reverse path actually uses that deadline, so
+        # validate the effective value there rather than forbidding a zero
+        # forward timeout.
         if return_eligible and not (
             math.isfinite(return_deadline) and return_deadline > 0
         ):
@@ -190,6 +192,17 @@ class SimConfig:
                 "enable_kv_return requires a positive reverse-return deadline; "
                 "set fake_kv_return_deadline_ms or a positive "
                 "fake_bootstrap_timeout_s"
+            )
+
+        handle_timeout = getattr(
+            server_args, "fake_kv_return_handle_timeout_ms", None,
+        )
+        if handle_timeout is None:
+            handle_timeout = max(bootstrap_timeout_s * 4.0, 60.0) * 1000.0
+        else:
+            handle_timeout = _positive_finite_float(
+                handle_timeout,
+                "fake_kv_return_handle_timeout_ms",
             )
 
         retention_max_leases = _positive_int(
@@ -257,6 +270,7 @@ class SimConfig:
                 getattr(server_args, "fake_kv_return_max_tokens", 4096),
                 "fake_kv_return_max_tokens",
             ),
+            kv_return_handle_timeout_ms=handle_timeout,
             kv_return_deadline_ms=return_deadline,
             kv_return_bytes_per_token=return_bytes,
             kv_return_bandwidth_gb_s=return_bandwidth,

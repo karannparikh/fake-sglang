@@ -87,6 +87,15 @@ _KV_RETURN_FAILURE_REASONS = frozenset({
     "cancelled",
     "unexpected",
 })
+_KV_RETURN_CLAIM_RESULTS = frozenset({
+    "claimed",
+    "expired",
+    "released",
+    "already_claimed",
+    "not_registered",
+    "invalid_owner",
+    "other",
+})
 
 
 @dataclass
@@ -494,20 +503,25 @@ class Scheduler:
         *,
         now: float | None = None,
     ) -> KVRetentionClaim | None:
-        if (
-            not isinstance(lease, KVRetentionLease)
-            or lease._owner is not self._retention_owner
-        ):
+        if not isinstance(lease, KVRetentionLease):
             return None
         current = self._clock() if now is None else now
-        if (
-            lease.released
-            or lease._state.claim_token is not None              # noqa: SLF001
-            or self._retention_leases.get(lease.lease_id) is not lease
-        ):
+        delay_seconds = max(current - lease.created_at, 0.0)
+        if lease._owner is not self._retention_owner:
+            self.record_kv_return_claim_delay(delay_seconds, "invalid_owner")
+            return None
+        if lease.released:
+            self.record_kv_return_claim_delay(delay_seconds, "released")
+            return None
+        if lease._state.claim_token is not None:                 # noqa: SLF001
+            self.record_kv_return_claim_delay(delay_seconds, "already_claimed")
+            return None
+        if self._retention_leases.get(lease.lease_id) is not lease:
+            self.record_kv_return_claim_delay(delay_seconds, "not_registered")
             return None
         if lease.deadline <= current:
             self.release_retention(lease, reason="expired", now=current)
+            self.record_kv_return_claim_delay(delay_seconds, "expired")
             return None
 
         token = object()
@@ -518,6 +532,7 @@ class Scheduler:
         lease._state.claim_token = token                          # noqa: SLF001
         lease._state.claimed_at = current                         # noqa: SLF001
         lease._state.claim_deadline = deadline                    # noqa: SLF001
+        self.record_kv_return_claim_delay(delay_seconds, "claimed")
         return KVRetentionClaim(
             lease,
             current,
@@ -714,6 +729,15 @@ class Scheduler:
         )
         if self.cache_metrics is not None:
             self.cache_metrics.record_kv_return_failed(bounded)
+
+    def record_kv_return_claim_delay(
+        self,
+        seconds: float,
+        result: str,
+    ) -> None:
+        bounded = result if result in _KV_RETURN_CLAIM_RESULTS else "other"
+        if self.cache_metrics is not None:
+            self.cache_metrics.record_kv_return_claim_delay(seconds, bounded)
 
     def _publish_kv_return_state(self) -> None:
         if self.cache_metrics is not None:

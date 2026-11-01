@@ -79,7 +79,7 @@ def _ticket(raw):
         cache_salt=raw["cache_salt"],
         max_generated_tokens=raw["max_generated_tokens"],
         max_payload_bytes=raw["max_payload_bytes"],
-        deadline_ms=raw["deadline_ms"],
+        handle_timeout_ms=raw["handle_timeout_ms"],
     )
 
 
@@ -138,7 +138,7 @@ async def _running_server(
         await server.stop()
 
 
-async def _post(session, port, operation, payload, *, version=1):
+async def _post(session, port, operation, payload, *, version=2):
     async with session.post(
         f"http://127.0.0.1:{port}/kv-return/v{version}/{operation}",
         json=payload,
@@ -161,10 +161,6 @@ async def test_prepare_commit_and_duplicates_use_manager_atomically(
             server, scheduler, 10, prompt=prompt, salt=salt,
         )
         prepare = _prepare(ticket, generated)
-        commit = {
-            "prepare": asdict(prepare),
-            "generated_token_ids": list(generated),
-        }
         async with aiohttp.ClientSession() as session:
             first_prepare = await _post(
                 session, unused_port, "prepare", asdict(prepare),
@@ -172,6 +168,11 @@ async def test_prepare_commit_and_duplicates_use_manager_atomically(
             second_prepare = await _post(
                 session, unused_port, "prepare", asdict(prepare),
             )
+            commit = {
+                "prepare": asdict(prepare),
+                "transfer_ticket": first_prepare[1]["transfer_ticket"],
+                "generated_token_ids": list(generated),
+            }
             first_commit = await _post(
                 session, unused_port, "commit", commit,
             )
@@ -179,12 +180,18 @@ async def test_prepare_commit_and_duplicates_use_manager_atomically(
                 session, unused_port, "commit", commit,
             )
 
-    assert first_prepare == (200, {
-        "status": "ready",
-        "reason": "reservation_ready",
-        "idempotent": False,
-        "reserved_blocks": 1,
-    })
+    assert first_prepare[0] == 200
+    assert first_prepare[1]["status"] == "ready"
+    assert first_prepare[1]["reason"] == "reservation_ready"
+    assert first_prepare[1]["idempotent"] is False
+    assert first_prepare[1]["reserved_blocks"] == 1
+    assert first_prepare[1]["transfer_ticket"] == (
+        second_prepare[1]["transfer_ticket"]
+    )
+    transfer_ticket = first_prepare[1]["transfer_ticket"]
+    assert transfer_ticket["handle_nonce"] == ticket.nonce
+    assert transfer_ticket["attempt_id"] == ticket.attempt_id
+    assert transfer_ticket["deadline_ms"] == 500
     assert second_prepare[1]["idempotent"] is True
     assert first_commit == (200, {
         "status": "committed",
@@ -248,7 +255,7 @@ async def test_malformed_json_is_typed(
         _running_server(scheduler, unused_port),
         aiohttp.ClientSession() as session,
         session.post(
-            f"http://127.0.0.1:{unused_port}/kv-return/v1/prepare",
+            f"http://127.0.0.1:{unused_port}/kv-return/v2/prepare",
             data=body,
             headers={"Content-Type": "application/json"},
         ) as response,
@@ -271,15 +278,15 @@ async def test_huge_numeric_json_failures_are_typed(
     async with _running_server(scheduler, unused_port) as server:
         ticket = _publish(server, scheduler, 111)
         body = json.dumps(asdict(_prepare(ticket)))
-        assert '"deadline_ms": 500.0' in body
+        assert '"handle_timeout_ms": 120000.0' in body
         overflowing_number = body.replace(
-            '"deadline_ms": 500.0',
-            f'"deadline_ms": {"9" * 400}',
+            '"handle_timeout_ms": 120000.0',
+            f'"handle_timeout_ms": {"9" * 400}',
             1,
         )
         pathological_integer = body.replace(
-            '"deadline_ms": 500.0',
-            f'"deadline_ms": {"9" * 5000}',
+            '"handle_timeout_ms": 120000.0',
+            f'"handle_timeout_ms": {"9" * 5000}',
             1,
         )
         assert len(pathological_integer) < (1 << 20)
@@ -289,7 +296,7 @@ async def test_huge_numeric_json_failures_are_typed(
                 async with session.post(
                     (
                         f"http://127.0.0.1:{unused_port}"
-                        "/kv-return/v1/prepare"
+                        "/kv-return/v2/prepare"
                     ),
                     data=raw,
                     headers={"Content-Type": "application/json"},
@@ -301,7 +308,7 @@ async def test_huge_numeric_json_failures_are_typed(
     assert responses[0][0] == 400
     assert responses[0][1] == {
         "status": "invalid_request",
-        "reason": "ticket_deadline_ms_must_be_a_finite_number",
+        "reason": "ticket_handle_timeout_ms_must_be_a_finite_number",
         "idempotent": False,
         "reserved_blocks": 0,
     }
@@ -309,7 +316,7 @@ async def test_huge_numeric_json_failures_are_typed(
     assert responses[1][1]["status"] == "invalid_request"
     assert responses[1][1]["reason"] in {
         "malformed_json",
-        "ticket_deadline_ms_must_be_a_finite_number",
+        "ticket_handle_timeout_ms_must_be_a_finite_number",
     }
     assert responses[1][1]["idempotent"] is False
     assert responses[1][1]["reserved_blocks"] == 0
@@ -328,6 +335,12 @@ async def test_wrong_types_unknown_fields_and_oversized_bodies_are_rejected(
         unknown = dict(prepare, session_id="forbidden")
         oversized_tokens = {
             "prepare": prepare,
+            "transfer_ticket": {
+                "nonce": "t" * 32,
+                "handle_nonce": ticket.nonce,
+                "attempt_id": ticket.attempt_id,
+                "deadline_ms": 500.0,
+            },
             "generated_token_ids": list(range(
                 ticket.max_generated_tokens + 1
             )),
@@ -343,16 +356,16 @@ async def test_wrong_types_unknown_fields_and_oversized_bodies_are_rejected(
                 session, unused_port, "commit", oversized_tokens,
             )
             unsupported = await _post(
-                session, unused_port, "prepare", prepare, version=2,
+                session, unused_port, "prepare", prepare, version=3,
             )
             async with session.post(
-                f"http://127.0.0.1:{unused_port}/kv-return/v1/prepare",
+                f"http://127.0.0.1:{unused_port}/kv-return/v2/prepare",
                 data="{}",
                 headers={"Content-Type": "text/plain"},
             ) as response:
                 wrong_content_type = response.status, await response.json()
             async with session.post(
-                f"http://127.0.0.1:{unused_port}/kv-return/v1/prepare",
+                f"http://127.0.0.1:{unused_port}/kv-return/v2/prepare",
                 data="x" * ((1 << 20) + 1),
                 headers={"Content-Type": "application/json"},
             ) as response:
@@ -713,11 +726,13 @@ async def test_checksum_failure_has_no_partial_cache_or_events(
             token_ids_checksum="0" * 32,
         )
         async with aiohttp.ClientSession() as session:
-            assert (
-                await _post(session, unused_port, "prepare", asdict(prepare))
-            )[1]["status"] == "ready"
+            prepared = await _post(
+                session, unused_port, "prepare", asdict(prepare),
+            )
+            assert prepared[1]["status"] == "ready"
             rejected = await _post(session, unused_port, "commit", {
                 "prepare": asdict(prepare),
+                "transfer_ticket": prepared[1]["transfer_ticket"],
                 "generated_token_ids": list(generated),
             })
 

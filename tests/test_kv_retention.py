@@ -209,6 +209,30 @@ async def test_claimed_lease_is_owner_checked_and_exempt_from_idle_expiry(
     assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
 
 
+async def test_claim_retention_records_generation_to_claim_delay(server_args):
+    now = [100.0]
+    scheduler = scheduler_for(
+        server_args,
+        clock=lambda: now[0],
+        fake_kv_return_retention_timeout_ms=100,
+    )
+    observed = []
+    scheduler.record_kv_return_claim_delay = (
+        lambda seconds, result: observed.append((seconds, result))
+    )
+    request = await finish_prebuilt(
+        scheduler,
+        list(range(4)),
+        1,
+        rid="claim-delay",
+    )
+
+    now[0] = 100.1
+    assert scheduler.claim_retention(request.retention_lease) is None
+    assert request.retention_lease.release_reason == "expired"
+    assert observed == [(pytest.approx(0.1), "expired")]
+
+
 async def test_scheduler_loop_expires_idle_lease_without_a_new_request(server_args):
     scheduler = scheduler_for(
         server_args,

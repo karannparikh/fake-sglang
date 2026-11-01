@@ -111,6 +111,13 @@ class PrefixCacheMetrics:
             "Control-plane commit seconds for completed attempts.",
             ["dp_rank"], registry=None,
         ).labels(str(dp_rank))
+        self.kv_return_claim_delay_seconds = Histogram(
+            return_prefix + "claim_delay_seconds",
+            "Elapsed seconds from completed response generation to decode-retention claim attempt.",
+            ["dp_rank", "result"],
+            buckets=(0.001, 0.01, 0.1, 1, 5, 10, 30, 60, 120, 300),
+            registry=None,
+        )
         self.kv_return_active_tasks = Gauge(
             return_prefix + "active_tasks",
             "Tracked response-KV background tasks.",
@@ -164,6 +171,16 @@ class PrefixCacheMetrics:
 
     def record_kv_return_failed(self, reason: str) -> None:
         self.kv_return_failed.labels(self._dp_rank, reason).inc()
+
+    def record_kv_return_claim_delay(
+        self,
+        seconds: float,
+        result: str,
+    ) -> None:
+        self.kv_return_claim_delay_seconds.labels(
+            self._dp_rank,
+            result,
+        ).observe(seconds)
 
     def update_kv_return(
         self,

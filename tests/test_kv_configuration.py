@@ -72,8 +72,9 @@ def test_kv_return_defaults_fall_back_to_forward_settings(server_args):
         fake_bootstrap_timeout_s=4.25,
     ))
     assert not config.enable_kv_return
-    assert config.kv_return_protocol_version == 1
+    assert config.kv_return_protocol_version == 2
     assert config.kv_return_max_tokens == 4096
+    assert config.kv_return_handle_timeout_ms == 60000
     assert config.kv_return_deadline_ms == 4250
     assert config.kv_return_bytes_per_token == config.kv_bytes_per_token
     assert config.kv_return_bandwidth_gb_s == 23.5
@@ -100,6 +101,7 @@ def test_kv_return_cli_overrides_are_independent():
         "--model-path", "stub-model",
         "--enable-kv-return",
         "--fake-kv-return-max-tokens", "257",
+        "--fake-kv-return-handle-timeout-ms", "54321",
         "--fake-kv-return-deadline-ms", "1234.5",
         "--fake-kv-return-bytes-per-token", "8192",
         "--fake-kv-return-bandwidth-gb-s", "12.5",
@@ -112,6 +114,7 @@ def test_kv_return_cli_overrides_are_independent():
     config = SimConfig.from_server_args(args)
     assert config.enable_kv_return
     assert config.kv_return_max_tokens == 257
+    assert config.kv_return_handle_timeout_ms == 54321
     assert config.kv_return_deadline_ms == 1234.5
     assert config.kv_return_bytes_per_token == 8192
     assert config.kv_return_bandwidth_gb_s == 12.5
@@ -136,6 +139,7 @@ def test_invalid_kv_return_integer_settings_fail(server_args, field, value):
 
 
 @pytest.mark.parametrize("field", [
+    "fake_kv_return_handle_timeout_ms",
     "fake_kv_return_deadline_ms",
     "fake_kv_return_bandwidth_gb_s",
     "fake_kv_return_retention_timeout_ms",

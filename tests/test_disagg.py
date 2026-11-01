@@ -157,6 +157,7 @@ async def test_enabled_prefill_rooms_advertise_unique_return_tickets(
         disaggregation_bootstrap_port=unused_port,
         enable_kv_return=True,
         fake_kv_return_max_tokens=257,
+        fake_kv_return_handle_timeout_ms=60000,
         fake_kv_return_deadline_ms=1234.5,
     ))
     try:
@@ -172,11 +173,11 @@ async def test_enabled_prefill_rooms_advertise_unique_return_tickets(
             "cache_salt",
             "max_generated_tokens",
             "max_payload_bytes",
-            "deadline_ms",
+            "handle_timeout_ms",
         }
         assert first_ticket["room_id"] == 1101
         assert first_ticket["compatibility"] == {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "prefill_dp_rank": 0,
             "served_model_name": prefill.sim_config.served_model_name,
             "model_identity": prefill.sim_config.model_path,
@@ -192,7 +193,7 @@ async def test_enabled_prefill_rooms_advertise_unique_return_tickets(
         assert first_ticket["max_payload_bytes"] == (
             257 * prefill.sim_config.kv_return_bytes_per_token
         )
-        assert first_ticket["deadline_ms"] == 1234.5
+        assert first_ticket["handle_timeout_ms"] == 60000
         assert len(first_ticket["nonce"]) >= 32
         assert first_ticket["nonce"] != second_ticket["nonce"]
         assert first_ticket["attempt_id"] != second_ticket["attempt_id"]

@@ -40,6 +40,7 @@ from fakeengine.kv_return import (
     KVReturnResult,
     KVReturnStatus,
     KVReturnTicket,
+    KVReturnTransferTicket,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class KVReturnControlResponse:
     reason: str
     idempotent: bool
     reserved_blocks: int
+    transfer_ticket: Optional[KVReturnTransferTicket]
 
 
 class _ControlInputError(ValueError):
@@ -489,9 +491,12 @@ def _parse_prepare(value: Any) -> KVReturnPrepare:
 
 def _parse_commit(value: Any) -> KVReturnCommit:
     payload = _object(
-        value, "commit", {"prepare", "generated_token_ids"},
+        value,
+        "commit",
+        {"prepare", "transfer_ticket", "generated_token_ids"},
     )
     prepare = _parse_prepare(payload["prepare"])
+    transfer_ticket = _parse_transfer_ticket(payload["transfer_ticket"])
     raw_tokens = payload["generated_token_ids"]
     if not isinstance(raw_tokens, list):
         raise _ControlInputError("generated_token_ids_must_be_an_array")
@@ -499,6 +504,7 @@ def _parse_commit(value: Any) -> KVReturnCommit:
         raise _ControlInputError("generated_token_ids_exceed_ticket_limit", 413)
     return KVReturnCommit(
         prepare,
+        transfer_ticket,
         tuple(
             _integer(token, "generated_token_ids_item", minimum=0)
             for token in raw_tokens
@@ -530,7 +536,7 @@ def _parse_ticket(value: Any) -> KVReturnTicket:
             "cache_salt",
             "max_generated_tokens",
             "max_payload_bytes",
-            "deadline_ms",
+            "handle_timeout_ms",
         },
     )
     return KVReturnTicket(
@@ -561,8 +567,40 @@ def _parse_ticket(value: Any) -> KVReturnTicket:
             "ticket_max_payload_bytes",
             minimum=1,
         ),
+        handle_timeout_ms=_finite_number(
+            payload["handle_timeout_ms"],
+            "ticket_handle_timeout_ms",
+            positive=True,
+        ),
+    )
+
+
+def _parse_transfer_ticket(value: Any) -> KVReturnTransferTicket:
+    payload = _object(
+        value,
+        "transfer_ticket",
+        {"nonce", "handle_nonce", "attempt_id", "deadline_ms"},
+    )
+    return KVReturnTransferTicket(
+        nonce=_string(
+            payload["nonce"],
+            "transfer_ticket_nonce",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        ),
+        handle_nonce=_string(
+            payload["handle_nonce"],
+            "transfer_ticket_handle_nonce",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        ),
+        attempt_id=_string(
+            payload["attempt_id"],
+            "transfer_ticket_attempt_id",
+            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        ),
         deadline_ms=_finite_number(
-            payload["deadline_ms"], "ticket_deadline_ms", positive=True,
+            payload["deadline_ms"],
+            "transfer_ticket_deadline_ms",
+            positive=True,
         ),
     )
 
@@ -749,6 +787,7 @@ def _manager_response(result: KVReturnResult) -> web.Response:
         http_status,
         idempotent=result.idempotent,
         reserved_blocks=result.reserved_blocks,
+        transfer_ticket=result.transfer_ticket,
     )
 
 
@@ -759,6 +798,7 @@ def _control_response(
     *,
     idempotent: bool = False,
     reserved_blocks: int = 0,
+    transfer_ticket: Optional[KVReturnTransferTicket] = None,
 ) -> web.Response:
     payload = {
         "status": status,
@@ -766,6 +806,8 @@ def _control_response(
         "idempotent": idempotent,
         "reserved_blocks": reserved_blocks,
     }
+    if transfer_ticket is not None:
+        payload["transfer_ticket"] = asdict(transfer_ticket)
     return web.json_response(payload, status=http_status)
 
 
@@ -870,6 +912,7 @@ class BootstrapClient:
     ) -> KVReturnControlResponse:
         payload = {
             "prepare": asdict(commit.prepare),
+            "transfer_ticket": asdict(commit.transfer_ticket),
             "generated_token_ids": list(commit.generated_token_ids),
         }
         try:
@@ -1053,8 +1096,12 @@ def _parse_kv_return_response(
         raise KVReturnProtocolError(
             f"KV return {operation} response is not valid JSON"
         ) from exc
-    expected_fields = {"status", "reason", "idempotent", "reserved_blocks"}
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    base_fields = {"status", "reason", "idempotent", "reserved_blocks"}
+    if (
+        not isinstance(payload, dict)
+        or not base_fields.issubset(payload)
+        or set(payload) - base_fields - {"transfer_ticket"}
+    ):
         raise KVReturnProtocolError(
             f"KV return {operation} response has the wrong fields"
         )
@@ -1064,6 +1111,15 @@ def _parse_kv_return_response(
         raise KVReturnProtocolError(
             f"KV return {operation} response has an unknown status"
         ) from exc
+    expected_fields = (
+        base_fields | {"transfer_ticket"}
+        if status == KVReturnControlStatus.READY
+        else base_fields
+    )
+    if set(payload) != expected_fields:
+        raise KVReturnProtocolError(
+            f"KV return {operation} response has the wrong fields"
+        )
     if http_status not in _KV_RETURN_HTTP_STATUSES[status]:
         raise KVReturnProtocolError(
             f"KV return {operation} response status disagrees with HTTP status"
@@ -1107,6 +1163,17 @@ def _parse_kv_return_response(
         raise KVReturnProtocolError(
             f"KV return {operation} rejection reserved unexpected blocks"
         )
+    if status == KVReturnControlStatus.READY:
+        try:
+            transfer_ticket = _parse_transfer_ticket(
+                payload["transfer_ticket"]
+            )
+        except _ControlInputError as exc:
+            raise KVReturnProtocolError(
+                "KV return prepare response has an invalid transfer ticket"
+            ) from exc
+    else:
+        transfer_ticket = None
     return KVReturnControlResponse(
         operation=operation,
         protocol_version=protocol_version,
@@ -1115,6 +1182,7 @@ def _parse_kv_return_response(
         reason=reason,
         idempotent=idempotent,
         reserved_blocks=reserved_blocks,
+        transfer_ticket=transfer_ticket,
     )
 
 

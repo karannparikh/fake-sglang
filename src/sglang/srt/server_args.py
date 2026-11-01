@@ -129,6 +129,7 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("fake_kv_bandwidth_gb_s", "float", 64.0, None),
     ("fake_kv_transfer_overhead_ms", "float", 1.0, None),
     ("fake_kv_return_max_tokens", "int", 4096, None),
+    ("fake_kv_return_handle_timeout_ms", "float", None, None),
     ("fake_kv_return_deadline_ms", "float", None, None),
     ("fake_kv_return_bytes_per_token", "int", None, None),
     ("fake_kv_return_bandwidth_gb_s", "float", None, None),

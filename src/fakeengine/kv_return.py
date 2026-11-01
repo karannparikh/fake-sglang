@@ -58,6 +58,8 @@ class KVReturnCompatibility:
 
 @dataclass(frozen=True)
 class KVReturnTicket:
+    """Durable handoff capability for one response-KV return."""
+
     nonce: str
     room_id: int
     attempt_id: str
@@ -65,6 +67,16 @@ class KVReturnTicket:
     cache_salt: str | None
     max_generated_tokens: int
     max_payload_bytes: int
+    handle_timeout_ms: float
+
+
+@dataclass(frozen=True)
+class KVReturnTransferTicket:
+    """Short-lived commit capability minted after prepare."""
+
+    nonce: str
+    handle_nonce: str
+    attempt_id: str
     deadline_ms: float
 
 
@@ -83,6 +95,7 @@ class KVReturnPrepare:
 @dataclass(frozen=True)
 class KVReturnCommit:
     prepare: KVReturnPrepare
+    transfer_ticket: KVReturnTransferTicket
     generated_token_ids: tuple[int, ...]
 
 
@@ -96,6 +109,7 @@ class KVReturnAbort:
 class KVReturnResult:
     status: KVReturnStatus
     ticket: KVReturnTicket | None = None
+    transfer_ticket: KVReturnTransferTicket | None = None
     reserved_blocks: int = 0
     idempotent: bool = False
 
@@ -129,6 +143,7 @@ class _Attempt:
     prompt_ids: tuple[int, ...]
     expires_at: float
     prepare: KVReturnPrepare | None = None
+    transfer_ticket: KVReturnTransferTicket | None = None
     reservation: PrefixImportReservation | None = None
 
 
@@ -230,11 +245,11 @@ class KVReturnManager:
                 self.config.kv_return_max_tokens
                 * self.compatibility.kv_bytes_per_token
             ),
-            deadline_ms=self.config.kv_return_deadline_ms,
+            handle_timeout_ms=self.config.kv_return_handle_timeout_ms,
         )
         if not _wire_compatible_ticket(ticket):
             return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
-        expires_at = self._clock() + ticket.deadline_ms / 1000.0
+        expires_at = self._clock() + ticket.handle_timeout_ms / 1000.0
         self._attempts[nonce] = _Attempt(ticket, prompt, expires_at)
         return KVReturnResult(
             KVReturnStatus.ISSUED,
@@ -257,6 +272,7 @@ class KVReturnManager:
                 assert reservation is not None
                 return KVReturnResult(
                     KVReturnStatus.PREPARED,
+                    transfer_ticket=attempt.transfer_ticket,
                     reserved_blocks=reservation.reserved_blocks,
                     idempotent=True,
                 )
@@ -293,9 +309,19 @@ class KVReturnManager:
                 prepare=prepare,
             )
         attempt.prepare = prepare
+        attempt.transfer_ticket = KVReturnTransferTicket(
+            nonce=secrets.token_urlsafe(24),
+            handle_nonce=attempt.ticket.nonce,
+            attempt_id=attempt.ticket.attempt_id,
+            deadline_ms=self.config.kv_return_deadline_ms,
+        )
+        attempt.expires_at = (
+            self._clock() + attempt.transfer_ticket.deadline_ms / 1000.0
+        )
         attempt.reservation = reservation
         return KVReturnResult(
             KVReturnStatus.PREPARED,
+            transfer_ticket=attempt.transfer_ticket,
             reserved_blocks=reservation.reserved_blocks,
         )
 
@@ -322,6 +348,12 @@ class KVReturnManager:
                 commit=commit,
             )
         if prepare != attempt.prepare:
+            return self._finish(
+                attempt,
+                KVReturnStatus.INCOMPATIBLE,
+                commit=commit,
+            )
+        if commit.transfer_ticket != attempt.transfer_ticket:
             return self._finish(
                 attempt,
                 KVReturnStatus.INCOMPATIBLE,
@@ -450,7 +482,6 @@ class KVReturnManager:
             and prepare.claimed_payload_bytes == expected_bytes
             and expected_bytes <= ticket.max_payload_bytes
             and _valid_checksum(prepare.token_ids_checksum)
-            and self._clock() < attempt.expires_at
         )
 
     def _finish(
@@ -651,7 +682,7 @@ def _wire_compatible_ticket(ticket: KVReturnTicket) -> bool:
         )
         and _valid_wire_integer(ticket.max_generated_tokens, minimum=1)
         and _valid_wire_integer(ticket.max_payload_bytes, minimum=1)
-        and _valid_wire_number(ticket.deadline_ms, positive=True)
+        and _valid_wire_number(ticket.handle_timeout_ms, positive=True)
     )
 
 

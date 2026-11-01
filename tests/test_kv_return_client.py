@@ -402,7 +402,7 @@ class _BudgetPrepareServer(BootstrapServer):
         return await super()._prepare_kv_return(request)
 
 
-async def test_prepare_and_transfer_share_one_monotonic_budget(
+async def test_prepare_mints_a_fresh_transfer_budget(
     server_args,
     unused_port,
 ):
@@ -426,15 +426,15 @@ async def test_prepare_and_transfer_share_one_monotonic_budget(
         ) as server:
             metadata = _publish(server, scheduler, 45)
             metadata["ready_ts"] = time.time() + 86400
-            with pytest.raises(TimeoutError, match="simulated"):
-                await return_generated_kv(
-                    decode,
-                    client,
-                    host="127.0.0.1",
-                    port=unused_port,
-                    room_metadata=metadata,
-                    generated_token_ids=(5, 6, 7, 8),
-                )
+            outcome = await return_generated_kv(
+                decode,
+                client,
+                host="127.0.0.1",
+                port=unused_port,
+                room_metadata=metadata,
+                generated_token_ids=(5, 6, 7, 8),
+            )
+            assert outcome.status == KVReturnOutcomeStatus.COMMITTED
             assert scheduler.kv_return._attempts == {}
             assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
     finally:
@@ -496,6 +496,7 @@ class _WrongStatusPrepareServer(BootstrapServer):
                 "reason": "reservation_ready",
                 "idempotent": False,
                 "reserved_blocks": 1,
+                "transfer_ticket": {},
             },
             status=409,
         )
@@ -730,7 +731,7 @@ async def test_inconsistent_local_ticket_is_rejected_before_network(
     metadata = _publish(server, scheduler, 42)
     decode = _config(server_args, "decode")
     if mismatch == "protocol":
-        metadata["kv_return"]["compatibility"]["protocol_version"] = 2
+        metadata["kv_return"]["compatibility"]["protocol_version"] = 3
     else:
         decode.served_model_name = "other-model"
     client = BootstrapClient(0.001, 1)
