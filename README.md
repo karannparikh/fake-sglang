@@ -396,10 +396,15 @@ requests never publish `kv_return` metadata.
 `--enable-kv-return` is disabled by default. On a real disaggregated prefill
 room with radix caching enabled, it adds a version-1 `kv_return` object with an
 unguessable per-room nonce, the prefill DP rank, the maximum return-token count
-and the deadline. No session ID is used. This first stack layer only negotiates
-that capability: decode does not retain generated KV, transfer it back, import
-it into the prefill scheduler, call prepare/commit endpoints, or start any
-background return task yet.
+and the deadline. No session ID is used.
+
+The scheduler also has an internal, currently unwired prefix-import primitive.
+It can reserve clean KV blocks without evicting existing prefixes, then
+atomically install the full blocks of a prompt plus generated-token tail through
+the normal prefix-cache and `BlockStored` event path. Failed imports release
+their reservation without partially changing the cache. This layer does not
+connect that primitive to return tickets, HTTP, decode retention, transfer
+timing, retries, expiry, orchestration, or background tasks.
 
 ## KV-aware routing
 

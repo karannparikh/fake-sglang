@@ -176,6 +176,22 @@ class BlockPool:
         self._notify_evicted(evicted)
         return blocks
 
+    def allocate_clean(self, count: int) -> list[int] | None:
+        """Reserve clean blocks without evicting reusable prefixes."""
+        if count < 0 or count > len(self._free_clean):
+            return None
+        if count == 0:
+            return []
+
+        blocks: list[int] = []
+        for _ in range(count):
+            block = self._free_clean.pop()
+            self._free_clean_set.discard(block)
+            self._ref(block)
+            blocks.append(block)
+        self._notify_changed()
+        return blocks
+
     def free(self, blocks: Sequence[int]) -> None:
         for block in blocks:
             remaining = self._refcount.get(block, 1) - 1
@@ -209,7 +225,9 @@ class BlockPool:
             matched += 1
         return matched
 
-    def acquire_prefix(self, hashes: Sequence[bytes]) -> List[int]:
+    def acquire_prefix(
+        self, hashes: Sequence[bytes], *, touch: bool = True,
+    ) -> list[int]:
         """Match a prefix and take a reference on every block it hits.
 
         Sharing the blocks is what makes a cache hit real: the request pays no
@@ -217,12 +235,13 @@ class BlockPool:
         being evicted underneath it. Matching without acquiring would report a
         hit and then let the next allocation invalidate it.
         """
-        acquired: List[int] = []
+        acquired: list[int] = []
         for digest in hashes:
             block = self._cached.get(digest)
             if block is None:
                 break
-            self._touch(digest)
+            if touch:
+                self._touch(digest)
             self._ref(block)
             acquired.append(block)
         self._notify_changed()
@@ -262,6 +281,32 @@ class BlockPool:
             added.append((index, digest))
         self._notify_changed()
         return added
+
+    def insert_prefix_atomic(
+        self, hashes: Sequence[bytes], blocks: Sequence[int]
+    ) -> list[tuple[int, bytes]] | None:
+        """Insert a complete prefix only when every mapping is compatible."""
+        if len(hashes) != len(blocks):
+            return None
+
+        assigned: dict[int, bytes] = {}
+        saw_new = False
+        for index, (digest, block) in enumerate(zip(hashes, blocks)):
+            expected_parent = hashes[index - 1] if index else None
+            if digest in self._cached:
+                if saw_new or self._parents.get(digest) != expected_parent:
+                    return None
+                continue
+
+            saw_new = True
+            previous = self._block_to_digest.get(block)
+            if previous is not None and previous != digest:
+                return None
+            if block in assigned and assigned[block] != digest:
+                return None
+            assigned[block] = digest
+
+        return self.insert_prefix(hashes, blocks)
 
     def clear_cache(self) -> None:
         """Drop every unreferenced cache entry, reporting the removals."""
