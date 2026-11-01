@@ -57,6 +57,27 @@ class TimingModel:
         seconds = payload_bytes / (bandwidth * _BYTES_PER_GB)
         return overhead + seconds * 1000.0
 
+    def kv_return_transfer_ms(
+        self,
+        generated_tokens: int,
+        link: Link | None = None,
+    ) -> float:
+        """Generated-response KV bytes over the reverse link."""
+        cfg = self.config
+        bandwidth = (
+            link.bandwidth_gb_s
+            if link is not None
+            else cfg.kv_return_bandwidth_gb_s
+        )
+        overhead = (
+            link.latency_ms
+            if link is not None
+            else cfg.kv_return_overhead_ms
+        )
+        payload_bytes = generated_tokens * cfg.kv_return_bytes_per_token
+        seconds = payload_bytes / (bandwidth * _BYTES_PER_GB)
+        return overhead + seconds * 1000.0
+
     async def sleep_ms(self, milliseconds: float) -> None:
         if milliseconds <= 0:
             return
