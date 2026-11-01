@@ -17,6 +17,12 @@ if TYPE_CHECKING:
     from fakeengine.scheduler import PrefixImportReservation, Scheduler
 
 
+KV_RETURN_MAX_IDENTIFIER_LENGTH = 256
+KV_RETURN_MAX_METADATA_LENGTH = 4096
+KV_RETURN_MAX_INTEGER = (1 << 63) - 1
+KV_RETURN_FINGERPRINT_LENGTH = 32
+
+
 class KVReturnStatus(str, Enum):
     ISSUED = "issued"
     DISABLED = "disabled"
@@ -174,16 +180,27 @@ class KVReturnManager:
         self.expire()
         if not self._enabled():
             return KVReturnResult(KVReturnStatus.DISABLED)
-        if isinstance(room_id, bool) or not isinstance(room_id, int) or room_id < 0:
+        if not _valid_wire_integer(room_id, minimum=0):
             return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
         prompt = tuple(prompt_ids)
         if len(prompt) > self.config.context_len or not self._valid_tokens(prompt):
             return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
-        if cache_salt is not None and not isinstance(cache_salt, str):
+        if (
+            cache_salt is not None
+            and (
+                not isinstance(cache_salt, str)
+                or len(cache_salt) > KV_RETURN_MAX_METADATA_LENGTH
+            )
+        ):
             return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
         salt = cache_salt or None
         attempt = secrets.token_urlsafe(18) if attempt_id is None else attempt_id
-        if not isinstance(attempt, str) or not attempt or len(attempt) > 256:
+        if (
+            not isinstance(attempt, str)
+            or not attempt
+            or len(attempt) > KV_RETURN_MAX_IDENTIFIER_LENGTH
+            or not _wire_compatible_compatibility(self.compatibility)
+        ):
             return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
 
         nonce = self._new_nonce()
@@ -200,6 +217,8 @@ class KVReturnManager:
             ),
             deadline_ms=self.config.kv_return_deadline_ms,
         )
+        if not _wire_compatible_ticket(ticket):
+            return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
         expires_at = self._clock() + ticket.deadline_ms / 1000.0
         self._attempts[nonce] = _Attempt(ticket, prompt, expires_at)
         return KVReturnResult(
@@ -375,6 +394,23 @@ class KVReturnManager:
         self._attempts.clear()
         self._terminal.clear()
 
+    def clear_ticket(self, ticket: KVReturnTicket) -> bool:
+        """Release and forget one exact ticket, including terminal state."""
+        attempt = self._attempts.get(ticket.nonce)
+        if attempt is not None:
+            if attempt.ticket != ticket:
+                return False
+            if attempt.reservation is not None:
+                self.scheduler.release_prefix_import(attempt.reservation)
+            self._attempts.pop(ticket.nonce, None)
+            return True
+
+        terminal = self._terminal.get(ticket.nonce)
+        if terminal is None or terminal.ticket != ticket:
+            return False
+        self._terminal.pop(ticket.nonce, None)
+        return True
+
     def _valid_prepare(self, attempt: _Attempt, prepare: KVReturnPrepare) -> bool:
         ticket = prepare.ticket
         count = prepare.generated_token_count
@@ -521,8 +557,85 @@ def kv_return_checksum(
 def _valid_checksum(value: object) -> bool:
     return (
         isinstance(value, str)
-        and len(value) == 32
+        and len(value) == KV_RETURN_FINGERPRINT_LENGTH
         and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _valid_wire_integer(value: object, *, minimum: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= KV_RETURN_MAX_INTEGER
+    )
+
+
+def _valid_wire_number(value: object, *, positive: bool) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value <= KV_RETURN_MAX_INTEGER
+        and math.isfinite(value)
+        and (not positive or value > 0)
+    )
+
+
+def _valid_wire_string(
+    value: object,
+    *,
+    maximum: int,
+    optional: bool = False,
+) -> bool:
+    if optional and value is None:
+        return True
+    return (
+        isinstance(value, str)
+        and (optional or bool(value))
+        and len(value) <= maximum
+    )
+
+
+def _wire_compatible_compatibility(
+    compatibility: KVReturnCompatibility,
+) -> bool:
+    return (
+        _valid_wire_integer(compatibility.protocol_version, minimum=0)
+        and _valid_wire_integer(compatibility.prefill_dp_rank, minimum=0)
+        and _valid_wire_string(
+            compatibility.served_model_name,
+            maximum=KV_RETURN_MAX_METADATA_LENGTH,
+        )
+        and _valid_wire_string(
+            compatibility.model_identity,
+            maximum=KV_RETURN_MAX_METADATA_LENGTH,
+        )
+        and _valid_wire_integer(compatibility.vocab_size, minimum=1)
+        and _valid_wire_integer(compatibility.block_size, minimum=1)
+        and _valid_wire_integer(compatibility.kv_bytes_per_token, minimum=1)
+        and _valid_checksum(compatibility.kv_layout_fingerprint)
+    )
+
+
+def _wire_compatible_ticket(ticket: KVReturnTicket) -> bool:
+    return (
+        _valid_wire_string(
+            ticket.nonce,
+            maximum=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        )
+        and _valid_wire_integer(ticket.room_id, minimum=0)
+        and _valid_wire_string(
+            ticket.attempt_id,
+            maximum=KV_RETURN_MAX_IDENTIFIER_LENGTH,
+        )
+        and _wire_compatible_compatibility(ticket.compatibility)
+        and _valid_wire_string(
+            ticket.cache_salt,
+            maximum=KV_RETURN_MAX_METADATA_LENGTH,
+            optional=True,
+        )
+        and _valid_wire_integer(ticket.max_generated_tokens, minimum=1)
+        and _valid_wire_integer(ticket.max_payload_bytes, minimum=1)
+        and _valid_wire_number(ticket.deadline_ms, positive=True)
     )
 
 

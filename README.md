@@ -394,20 +394,33 @@ it; without that path, warmup would block for its 1800 s timeout. Sentinel
 requests never publish `kv_return` metadata.
 
 `--enable-kv-return` is disabled by default. On a real disaggregated prefill
-room with radix caching enabled, it adds a version-1 `kv_return` object with an
-unguessable per-room nonce, the prefill DP rank, the maximum return-token count
-and the deadline. No session ID is used.
+room with radix caching enabled, the bootstrap server asks that rank's return
+manager to issue the `kv_return` ticket placed in room metadata. The ticket has
+an unguessable nonce and attempt ID, exact room and prefill DP rank, cache
+namespace, token/byte/deadline limits, and the complete model/KV compatibility
+contract. No session ID is used.
 
-The scheduler also has a local, currently unwired reverse-return state manager.
-It issues nonce-bound tickets for eligible prefill rooms, binds them to the
-model/KV compatibility contract and cache namespace, validates prepare and
-commit attempts, reserves clean capacity, and imports successful token tails
-through the scheduler's atomic prefix-import and `BlockStored` event path.
-Attempts and bounded idempotency records expire deterministically, and abort or
-shutdown releases every reservation. This layer has no network transport:
-there are no HTTP handlers or clients, decode-side KV retention, simulated
-reverse-transfer sleeps, engine background return tasks, or end-to-end
-orchestration yet.
+The prefill bootstrap HTTP server exposes the manager lifecycle directly:
+
+```
+POST /kv-return/v1/prepare  -> READY only after clean capacity is reserved
+POST /kv-return/v1/commit   -> atomically imports the validated token tail
+POST /kv-return/v1/abort    -> releases an issued or prepared attempt
+```
+
+Each operation carries the complete ticket and attempt controls. JSON fields
+and types are strict, request and token-array sizes are bounded, and stable
+status/reason bodies distinguish malformed input, missing or expired tickets,
+compatibility mismatch, capacity rejection, checksum/token failure and import
+failure. Exact duplicate requests preserve the manager's idempotent result.
+The existing bootstrap sweeper expires manager attempts; an unclaimed room's
+expiry clears its active or terminal ticket state, and server shutdown releases
+all reservations and idempotency records.
+
+This layer is server control only. It has no decode-side reverse
+`BootstrapClient`, response-KV retention, reverse-transfer timing or sleep,
+background return task, or end-to-end next-turn orchestration. Normal decode
+generation does not invoke these endpoints yet.
 
 ## KV-aware routing
 

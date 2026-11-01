@@ -164,25 +164,43 @@ async def test_enabled_prefill_rooms_advertise_unique_return_tickets(
         first_ticket = first["kv_return"]
         second_ticket = second["kv_return"]
         assert set(first_ticket) == {
-            "version",
-            "enabled",
             "nonce",
-            "prefill_dp_rank",
-            "max_return_tokens",
+            "room_id",
+            "attempt_id",
+            "compatibility",
+            "cache_salt",
+            "max_generated_tokens",
+            "max_payload_bytes",
             "deadline_ms",
         }
-        assert first_ticket == {
-            "version": 1,
-            "enabled": True,
-            "nonce": first_ticket["nonce"],
+        assert first_ticket["room_id"] == 1101
+        assert first_ticket["compatibility"] == {
+            "protocol_version": 1,
             "prefill_dp_rank": 0,
-            "max_return_tokens": 257,
-            "deadline_ms": 1234.5,
+            "served_model_name": prefill.sim_config.served_model_name,
+            "model_identity": prefill.sim_config.model_path,
+            "vocab_size": prefill.sim_config.vocab_size,
+            "block_size": prefill.sim_config.block_size,
+            "kv_bytes_per_token": prefill.sim_config.kv_return_bytes_per_token,
+            "kv_layout_fingerprint": first_ticket["compatibility"][
+                "kv_layout_fingerprint"
+            ],
         }
+        assert first_ticket["cache_salt"] is None
+        assert first_ticket["max_generated_tokens"] == 257
+        assert first_ticket["max_payload_bytes"] == (
+            257 * prefill.sim_config.kv_return_bytes_per_token
+        )
+        assert first_ticket["deadline_ms"] == 1234.5
         assert len(first_ticket["nonce"]) >= 32
         assert first_ticket["nonce"] != second_ticket["nonce"]
-        assert "session_id" not in first_ticket
-        assert "session_id" not in second_ticket
+        assert first_ticket["attempt_id"] != second_ticket["attempt_id"]
+        assert "session_id" not in str(first_ticket)
+        assert "session_id" not in str(second_ticket)
+        assert set(prefill.scheduler.kv_return._attempts) == {
+            first_ticket["nonce"],
+            second_ticket["nonce"],
+        }
     finally:
         await prefill._async_shutdown()
 
