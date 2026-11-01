@@ -311,6 +311,10 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-kv-return-bytes-per-token` | model-derived forward value | Reverse-transfer payload bytes per generated token |
 | `--fake-kv-return-bandwidth-gb-s` | forward KV bandwidth | Reverse-transfer bandwidth override |
 | `--fake-kv-return-overhead-ms` | forward transfer overhead | Fixed reverse-transfer overhead override |
+| `--fake-kv-return-retention-max-leases` | 32 | Maximum completed decode responses whose KV may remain retained |
+| `--fake-kv-return-retention-max-blocks` | all worker blocks | Maximum blocks held by completed-response retention leases |
+| `--fake-kv-return-retention-max-bytes` | retention block budget x block bytes | Maximum KV bytes held by completed-response retention leases |
+| `--fake-kv-return-retention-timeout-ms` | return-ticket deadline | Time before an unreleased completed-response lease expires |
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
@@ -353,6 +357,24 @@ back to `bootstrap timeout x 1000`, enabling KV return on an eligible prefill
 room with a zero bootstrap timeout requires an explicit positive
 `--fake-kv-return-deadline-ms`. Unset reverse-transfer overrides inherit the
 existing forward-transfer or model-derived values.
+
+Completed decode KV retention is also opt-in per prebuilt request and is off by
+default. On successful completion, the scheduler can expose a typed lease that
+keeps the request's existing response-overlapping blocks referenced. For block
+size `B`, prompt length `P`, and generated length `G`, the lease owns block
+indices `floor(P/B)` through `ceil((P+G)/B)-1`; an unaligned prompt therefore
+retains the shared prompt/response boundary block. The lease carries the
+request ID, prompt and generated token counts, generated token IDs for later
+commit orchestration, exact block IDs and retained bytes, `cache_salt`, and
+creation/deadline/release state. Raw token IDs are not logged.
+
+Leases remain visible in ordinary scheduler KV occupancy plus
+`kv_retention_*` scheduler stats until idempotent explicit release, deterministic
+timeout expiry, abort-all, or scheduler shutdown. Count, block, and byte
+budgets decline only the retention optimization; the completed model response
+still succeeds and its terminal output does not wait for release. Aborted or
+failed requests never create leases. Retained prebuilt decode blocks are not
+inserted into the local prefix cache and do not publish KV store events.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
@@ -425,10 +447,11 @@ deadline across all three phases, uses only generated-response KV bytes, uses
 the decode-to-prefill topology link when both locations are known, and
 best-effort aborts a prepared attempt when transfer or commit fails.
 
-This helper is intentionally not connected to decode completion. Decode
-scheduler blocks are not retained for it, generation does not schedule it,
-client response timing and metadata are unchanged, and there is no background
-return task or end-to-end next-turn orchestration yet.
+This helper is intentionally not connected to decode completion. The scheduler
+now has an explicit prebuilt-request opt-in that can retain completed response
+KV, but it does not invoke the reverse client, schedule background return work,
+or add response metadata. Network return and end-to-end next-turn orchestration
+are not connected yet.
 
 ## KV-aware routing
 

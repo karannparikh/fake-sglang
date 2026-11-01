@@ -270,6 +270,7 @@ class KVReturnManager:
                 prepare=prepare,
             )
 
+        self.scheduler.expire_retention_leases()
         prompt_blocks = len(attempt.prompt_ids) // self.config.block_size
         total_blocks = (
             len(attempt.prompt_ids) + prepare.generated_token_count
