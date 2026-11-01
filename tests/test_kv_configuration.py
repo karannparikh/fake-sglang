@@ -58,6 +58,151 @@ def test_block_capacity_and_zero_generation_cost_remain_defaults(server_args):
     )
 
 
+def test_kv_return_cli_flag_defaults_off():
+    disabled = prepare_server_args(["--model-path", "stub-model"])
+    enabled = prepare_server_args(["--model-path", "stub-model", "--enable-kv-return"])
+    assert not disabled.enable_kv_return
+    assert enabled.enable_kv_return
+
+
+def test_kv_return_defaults_fall_back_to_forward_settings(server_args):
+    config = SimConfig.from_server_args(server_args(
+        fake_kv_bandwidth_gb_s=23.5,
+        fake_kv_transfer_overhead_ms=2.5,
+        fake_bootstrap_timeout_s=4.25,
+    ))
+    assert not config.enable_kv_return
+    assert config.kv_return_protocol_version == 1
+    assert config.kv_return_max_tokens == 4096
+    assert config.kv_return_deadline_ms == 4250
+    assert config.kv_return_bytes_per_token == config.kv_bytes_per_token
+    assert config.kv_return_bandwidth_gb_s == 23.5
+    assert config.kv_return_overhead_ms == 2.5
+
+
+def test_disabled_kv_return_preserves_zero_forward_transfer_overhead(server_args):
+    config = SimConfig.from_server_args(server_args(
+        enable_kv_return=False,
+        fake_kv_transfer_overhead_ms=0,
+    ))
+    assert config.kv_transfer_overhead_ms == 0
+    assert config.kv_return_overhead_ms == 0
+
+
+def test_kv_return_cli_overrides_are_independent():
+    args = prepare_server_args([
+        "--model-path", "stub-model",
+        "--enable-kv-return",
+        "--fake-kv-return-max-tokens", "257",
+        "--fake-kv-return-deadline-ms", "1234.5",
+        "--fake-kv-return-bytes-per-token", "8192",
+        "--fake-kv-return-bandwidth-gb-s", "12.5",
+        "--fake-kv-return-overhead-ms", "0",
+    ])
+    config = SimConfig.from_server_args(args)
+    assert config.enable_kv_return
+    assert config.kv_return_max_tokens == 257
+    assert config.kv_return_deadline_ms == 1234.5
+    assert config.kv_return_bytes_per_token == 8192
+    assert config.kv_return_bandwidth_gb_s == 12.5
+    assert config.kv_return_overhead_ms == 0
+
+
+@pytest.mark.parametrize("field", [
+    "fake_kv_return_max_tokens",
+    "fake_kv_return_bytes_per_token",
+])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_invalid_kv_return_integer_settings_fail(server_args, field, value):
+    with pytest.raises(ValueError, match=field):
+        SimConfig.from_server_args(server_args(**{field: value}))
+
+
+@pytest.mark.parametrize("field", [
+    "fake_kv_return_deadline_ms",
+    "fake_kv_return_bandwidth_gb_s",
+])
+@pytest.mark.parametrize(
+    "value",
+    [0, -1, True, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_kv_return_float_settings_fail(server_args, field, value):
+    with pytest.raises(ValueError, match=field):
+        SimConfig.from_server_args(server_args(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, True, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_kv_return_overhead_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_kv_return_overhead_ms"):
+        SimConfig.from_server_args(server_args(
+            fake_kv_return_overhead_ms=value,
+        ))
+
+
+@pytest.mark.parametrize("value", [0, float("nan"), float("inf")])
+def test_invalid_kv_bandwidth_fallback_source_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_kv_bandwidth_gb_s"):
+        SimConfig.from_server_args(server_args(fake_kv_bandwidth_gb_s=value))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_bootstrap_timeout_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_bootstrap_timeout_s"):
+        SimConfig.from_server_args(server_args(fake_bootstrap_timeout_s=value))
+
+
+@pytest.mark.parametrize("overrides", [
+    {"enable_kv_return": False},
+    {"enable_kv_return": False, "disaggregation_mode": "null"},
+    {"enable_kv_return": False, "disable_radix_cache": True},
+    {"enable_kv_return": True, "disable_radix_cache": True},
+])
+def test_zero_bootstrap_timeout_accepted_when_return_ineligible(server_args, overrides):
+    config = SimConfig.from_server_args(server_args(
+        fake_bootstrap_timeout_s=0, **overrides,
+    ))
+    assert config.bootstrap_timeout_s == 0
+    assert config.kv_return_deadline_ms == 0
+
+
+def test_zero_bootstrap_timeout_with_positive_return_override_enables_return(server_args):
+    config = SimConfig.from_server_args(server_args(
+        enable_kv_return=True,
+        disaggregation_mode="prefill",
+        fake_bootstrap_timeout_s=0,
+        fake_kv_return_deadline_ms=1234.5,
+    ))
+    assert config.enable_kv_return
+    assert config.bootstrap_timeout_s == 0
+    assert config.kv_return_deadline_ms == 1234.5
+
+
+def test_enabled_return_with_zero_effective_deadline_fails(server_args):
+    with pytest.raises(ValueError, match="positive reverse-return deadline"):
+        SimConfig.from_server_args(server_args(
+            enable_kv_return=True,
+            disaggregation_mode="prefill",
+            fake_bootstrap_timeout_s=0,
+        ))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_forward_transfer_overhead_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_kv_transfer_overhead_ms"):
+        SimConfig.from_server_args(server_args(
+            fake_kv_transfer_overhead_ms=value,
+        ))
+
+
 def test_default_worker_profile_matches_h200_experiment():
     args = ServerArgs(model_path="stub-model", served_model_name="stub-model")
     config = SimConfig.from_server_args(args)
