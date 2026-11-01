@@ -391,6 +391,7 @@ class Engine:
             bootstrap_room=bootstrap_room,
             cache_salt=_single_salt(cache_salt),
             scheduler=self.schedulers[rank],
+            dp_rank=rank,
             ignore_eos=ignore_eos,
             min_new_tokens=min_new,
         )
@@ -453,6 +454,7 @@ class Engine:
         bootstrap_port: Optional[int],
         bootstrap_room: Optional[int],
         scheduler: Scheduler,
+        dp_rank: int,
         cache_salt: Optional[str] = None,
         ignore_eos: bool = False,
         min_new_tokens: int = 0,
@@ -488,7 +490,12 @@ class Engine:
 
         sender: Optional[KVSender] = None
         if mode == "prefill" and bootstrap_room is not None:
-            sender = KVSender(self.sim_config, self._bootstrap_server, bootstrap_room)
+            sender = KVSender(
+                self.sim_config,
+                self._bootstrap_server,
+                bootstrap_room,
+                dp_rank=dp_rank,
+            )
 
         published = False
         try:
