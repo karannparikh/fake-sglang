@@ -232,7 +232,7 @@ class Engine:
                     cleanup.callback(fpm.close)
                 scheduler = Scheduler(
                     self.sim_config, kv_events=events,
-                    fpm=fpm, cache_metrics=cache_metrics,
+                    fpm=fpm, cache_metrics=cache_metrics, dp_rank=rank,
                 )
                 self.schedulers.append(scheduler)
                 self._rank_metrics.append(MetricsPusher(

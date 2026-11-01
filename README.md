@@ -398,13 +398,16 @@ room with radix caching enabled, it adds a version-1 `kv_return` object with an
 unguessable per-room nonce, the prefill DP rank, the maximum return-token count
 and the deadline. No session ID is used.
 
-The scheduler also has an internal, currently unwired prefix-import primitive.
-It can reserve clean KV blocks without evicting existing prefixes, then
-atomically install the full blocks of a prompt plus generated-token tail through
-the normal prefix-cache and `BlockStored` event path. Failed imports release
-their reservation without partially changing the cache. This layer does not
-connect that primitive to return tickets, HTTP, decode retention, transfer
-timing, retries, expiry, orchestration, or background tasks.
+The scheduler also has a local, currently unwired reverse-return state manager.
+It issues nonce-bound tickets for eligible prefill rooms, binds them to the
+model/KV compatibility contract and cache namespace, validates prepare and
+commit attempts, reserves clean capacity, and imports successful token tails
+through the scheduler's atomic prefix-import and `BlockStored` event path.
+Attempts and bounded idempotency records expire deterministically, and abort or
+shutdown releases every reservation. This layer has no network transport:
+there are no HTTP handlers or clients, decode-side KV retention, simulated
+reverse-transfer sleeps, engine background return tasks, or end-to-end
+orchestration yet.
 
 ## KV-aware routing
 
