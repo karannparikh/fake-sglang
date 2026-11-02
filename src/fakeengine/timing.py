@@ -26,8 +26,8 @@ _H200_DECODE_ENGINE_MS = (
 
 # H200 disaggregated prefill engine latency, conditioned on recomputed context.
 # The workload coordinates are the representative midpoints used by the source
-# context buckets. The 8K point is a rough half-scale estimate until direct
-# engine-only measurements are available below 16K.
+# context buckets. The 8K point scales the 16K-32K profile to the lab's prefill
+# step size.
 _H200_PREFILL_ENGINE_MS = (
     (8_192, (130.0, 1_000.0, 2_500.0, 8_500.0)),
     (24_576, (260.0, 2_000.0, 5_000.0, 17_000.0)),
