@@ -13,7 +13,7 @@ from fakeengine.topology import Topology, load as load_topology
 logger = logging.getLogger(__name__)
 
 _BANNER_SHOWN = False
-KV_RETURN_PROTOCOL_VERSION = 2
+KV_RETURN_PROTOCOL_VERSION = 1
 
 
 @dataclass
@@ -21,6 +21,7 @@ class SimConfig:
     model_path: str
     served_model_name: str
     disaggregation_mode: str        # null | prefill | decode
+    timing_profile: str             # aggregated | disaggregated
     vocab_size: int
     context_len: int
     kv_bytes_per_token: int
@@ -40,8 +41,7 @@ class SimConfig:
     enable_kv_return: bool  # Advertise reverse-KV return on eligible rooms.
     kv_return_protocol_version: int  # Version of the return-ticket schema.
     kv_return_max_tokens: int  # Maximum generated tokens a ticket accepts.
-    kv_return_handle_timeout_ms: float  # Handoff-handle lifetime.
-    kv_return_deadline_ms: float  # Prepared transfer-ticket lifetime.
+    kv_return_deadline_ms: float  # Return-ticket deadline in milliseconds.
     kv_return_bytes_per_token: int  # Reverse payload bytes per generated token.
     kv_return_bandwidth_gb_s: float  # Simulated reverse-transfer bandwidth.
     kv_return_overhead_ms: float  # Fixed reverse-transfer cost in milliseconds.
@@ -123,6 +123,53 @@ class SimConfig:
             or 8192
         )
 
+        disaggregation_mode = server_args.disaggregation_mode or "null"
+        timing_profile = server_args.fake_timing_profile
+        if timing_profile not in {"auto", "aggregated", "disaggregated"}:
+            raise ValueError(
+                "fake_timing_profile must be auto, aggregated, or disaggregated"
+            )
+        if timing_profile == "auto":
+            timing_profile = (
+                "aggregated"
+                if disaggregation_mode == "null"
+                else "disaggregated"
+            )
+        timing_defaults = {
+            "aggregated": {
+                "prefill_ms_per_1k": 55.0,
+                "prefill_overhead_ms": 4.0,
+                "itl_ms": 9.0,
+                "itl_ms_per_running_req": 0.35,
+            },
+            "disaggregated": {
+                "prefill_ms_per_1k": 55.0,
+                "prefill_overhead_ms": 320.0,
+                "itl_ms": 3.6,
+                "itl_ms_per_running_req": 0.0,
+            },
+        }[timing_profile]
+        prefill_ms_per_1k = _timing_value(
+            server_args.fake_prefill_ms_per_1k_tokens,
+            timing_defaults["prefill_ms_per_1k"],
+            "fake_prefill_ms_per_1k_tokens",
+        )
+        prefill_overhead_ms = _timing_value(
+            server_args.fake_prefill_overhead_ms,
+            timing_defaults["prefill_overhead_ms"],
+            "fake_prefill_overhead_ms",
+        )
+        itl_ms = _timing_value(
+            server_args.fake_itl_ms,
+            timing_defaults["itl_ms"],
+            "fake_itl_ms",
+        )
+        itl_ms_per_running_req = _timing_value(
+            server_args.fake_itl_ms_per_running_req,
+            timing_defaults["itl_ms_per_running_req"],
+            "fake_itl_ms_per_running_req",
+        )
+
         location = getattr(server_args, "fake_location", None) or None
         topology = load_topology(getattr(server_args, "fake_topology", None))
         if topology is not None and location is not None:
@@ -145,7 +192,6 @@ class SimConfig:
         )
 
         enable_kv_return = bool(getattr(server_args, "enable_kv_return", False))
-        disaggregation_mode = server_args.disaggregation_mode or "null"
         prefix_caching = not bool(getattr(server_args, "disable_radix_cache", False))
         # Mirror ``KVSender._return_ticket``: the reverse path only produces a
         # ticket on prefill workers with radix caching enabled. Any other
@@ -192,10 +238,9 @@ class SimConfig:
                 "fake_kv_return_deadline_ms",
             )
         # A zero bootstrap timeout is a legitimate forward-path configuration,
-        # but it collapses the fallback prepared-transfer deadline to zero.
-        # Only an eligible reverse path actually uses that deadline, so
-        # validate the effective value there rather than forbidding a zero
-        # forward timeout.
+        # but it collapses the fallback reverse-return deadline to zero. Only
+        # an eligible reverse path actually uses that deadline, so validate the
+        # effective value there rather than forbidding a zero forward timeout.
         if return_eligible and not (
             math.isfinite(return_deadline) and return_deadline > 0
         ):
@@ -203,17 +248,6 @@ class SimConfig:
                 "enable_kv_return requires a positive reverse-return deadline; "
                 "set fake_kv_return_deadline_ms or a positive "
                 "fake_bootstrap_timeout_s"
-            )
-
-        handle_timeout = getattr(
-            server_args, "fake_kv_return_handle_timeout_ms", None,
-        )
-        if handle_timeout is None:
-            handle_timeout = max(bootstrap_timeout_s * 4.0, 60.0) * 1000.0
-        else:
-            handle_timeout = _positive_finite_float(
-                handle_timeout,
-                "fake_kv_return_handle_timeout_ms",
             )
 
         retention_max_leases = _positive_int(
@@ -257,6 +291,7 @@ class SimConfig:
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
             disaggregation_mode=disaggregation_mode,
+            timing_profile=timing_profile,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
             kv_bytes_per_token=kv_bytes_per_token,
@@ -268,11 +303,11 @@ class SimConfig:
                 server_args.stream_interval,
                 "stream_interval",
             ),
-            prefill_ms_per_1k=float(server_args.fake_prefill_ms_per_1k_tokens),
-            prefill_overhead_ms=float(server_args.fake_prefill_overhead_ms),
+            prefill_ms_per_1k=prefill_ms_per_1k,
+            prefill_overhead_ms=prefill_overhead_ms,
             kv_generation_ms_per_1k=kv_generation_ms,
-            itl_ms=float(server_args.fake_itl_ms),
-            itl_ms_per_running_req=float(server_args.fake_itl_ms_per_running_req),
+            itl_ms=itl_ms,
+            itl_ms_per_running_req=itl_ms_per_running_req,
             kv_bandwidth_gb_s=kv_bandwidth_gb_s,
             kv_transfer_overhead_ms=kv_transfer_overhead_ms,
             enable_kv_return=enable_kv_return,
@@ -281,7 +316,6 @@ class SimConfig:
                 getattr(server_args, "fake_kv_return_max_tokens", 4096),
                 "fake_kv_return_max_tokens",
             ),
-            kv_return_handle_timeout_ms=handle_timeout,
             kv_return_deadline_ms=return_deadline,
             kv_return_bytes_per_token=return_bytes,
             kv_return_bandwidth_gb_s=return_bandwidth,
@@ -321,7 +355,7 @@ def announce(config: SimConfig) -> None:
         "fake-sglang: SIMULATED engine -- no model weights, no real inference. "
         "mode=%s model=%s vocab=%d kv=%d blocks x %d tok "
         "(%.1f KiB/token) prefill=%.1fms/1k kv-generation=%.1fms/1k "
-        "itl=%.1fms xfer=%s speedup=%.2fx "
+        "timing=%s itl=%.1fms xfer=%s speedup=%.2fx "
         "output-len=%s output-token=%s location=%s",
         config.disaggregation_mode,
         config.served_model_name,
@@ -331,6 +365,7 @@ def announce(config: SimConfig) -> None:
         config.kv_bytes_per_token / 1024,
         config.prefill_ms_per_1k,
         config.kv_generation_ms_per_1k,
+        config.timing_profile,
         config.itl_ms,
         "per-link topology"
         if config.topology is not None
@@ -352,7 +387,7 @@ def _positive_int(value: Any, name: str) -> int:
 
 
 def _positive_finite_float(value: Any, name: str) -> float:
-    if value is True or value is False:
+    if isinstance(value, bool):
         raise ValueError(f"{name} must be finite and positive")
     try:
         number = float(value)
@@ -364,7 +399,7 @@ def _positive_finite_float(value: Any, name: str) -> float:
 
 
 def _nonnegative_finite_float(value: Any, name: str) -> float:
-    if value is True or value is False:
+    if isinstance(value, bool):
         raise ValueError(f"{name} must be finite and nonnegative")
     try:
         number = float(value)
@@ -373,3 +408,10 @@ def _nonnegative_finite_float(value: Any, name: str) -> float:
     if not math.isfinite(number) or number < 0:
         raise ValueError(f"{name} must be finite and nonnegative")
     return number
+
+
+def _timing_value(value: Any, default: float, name: str) -> float:
+    return _nonnegative_finite_float(
+        default if value is None else value,
+        name,
+    )

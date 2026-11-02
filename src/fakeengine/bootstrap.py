@@ -22,8 +22,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Mapping, Sequence
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from aiohttp import web
 
@@ -40,7 +39,6 @@ from fakeengine.kv_return import (
     KVReturnResult,
     KVReturnStatus,
     KVReturnTicket,
-    KVReturnTransferTicket,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,7 +84,6 @@ class KVReturnControlResponse:
     reason: str
     idempotent: bool
     reserved_blocks: int
-    transfer_ticket: Optional[KVReturnTransferTicket]
 
 
 class _ControlInputError(ValueError):
@@ -117,9 +114,7 @@ class BootstrapServer:
         }
         if len(self._kv_return_managers) != len(kv_return_managers):
             raise ValueError("KV return managers must have unique DP ranks")
-        self._room_returns: dict[
-            int, tuple[KVReturnManager, KVReturnTicket]
-        ] = {}
+        self._room_returns: Dict[int, Tuple[KVReturnManager, KVReturnTicket]] = {}
         self._runner: Optional[web.AppRunner] = None
         self._sweeper: Optional[asyncio.Task] = None
 
@@ -227,9 +222,9 @@ class BootstrapServer:
         kv_bytes: int,
         first_token: Optional[int] = None,
         location: Optional[str] = None,
-        prefill_dp_rank: int | None = None,
-        kv_return_prompt_ids: Sequence[int] | None = None,
-        kv_return_cache_salt: str | None = None,
+        prefill_dp_rank: Optional[int] = None,
+        kv_return_prompt_ids: Optional[Sequence[int]] = None,
+        kv_return_cache_salt: Optional[str] = None,
     ) -> None:
         """Publish prefill metadata and an optional KV-return capability ticket.
 
@@ -242,7 +237,7 @@ class BootstrapServer:
         # one for the same prompt.
         room_id = int(room)
         self._clear_room_return(room_id)
-        metadata: dict[str, Any] = {
+        metadata: Dict[str, Any] = {
             "bootstrap_room": room_id,
             "num_tokens": int(num_tokens),
             "kv_bytes": int(kv_bytes),
@@ -377,7 +372,7 @@ class BootstrapServer:
         self,
         version: int,
         ticket: KVReturnTicket,
-    ) -> tuple[KVReturnManager | None, web.Response | None]:
+    ) -> Tuple[Optional[KVReturnManager], Optional[web.Response]]:
         manager = self._kv_return_managers.get(
             ticket.compatibility.prefill_dp_rank
         )
@@ -491,12 +486,9 @@ def _parse_prepare(value: Any) -> KVReturnPrepare:
 
 def _parse_commit(value: Any) -> KVReturnCommit:
     payload = _object(
-        value,
-        "commit",
-        {"prepare", "transfer_ticket", "generated_token_ids"},
+        value, "commit", {"prepare", "generated_token_ids"},
     )
     prepare = _parse_prepare(payload["prepare"])
-    transfer_ticket = _parse_transfer_ticket(payload["transfer_ticket"])
     raw_tokens = payload["generated_token_ids"]
     if not isinstance(raw_tokens, list):
         raise _ControlInputError("generated_token_ids_must_be_an_array")
@@ -504,7 +496,6 @@ def _parse_commit(value: Any) -> KVReturnCommit:
         raise _ControlInputError("generated_token_ids_exceed_ticket_limit", 413)
     return KVReturnCommit(
         prepare,
-        transfer_ticket,
         tuple(
             _integer(token, "generated_token_ids_item", minimum=0)
             for token in raw_tokens
@@ -536,7 +527,7 @@ def _parse_ticket(value: Any) -> KVReturnTicket:
             "cache_salt",
             "max_generated_tokens",
             "max_payload_bytes",
-            "handle_timeout_ms",
+            "deadline_ms",
         },
     )
     return KVReturnTicket(
@@ -567,40 +558,8 @@ def _parse_ticket(value: Any) -> KVReturnTicket:
             "ticket_max_payload_bytes",
             minimum=1,
         ),
-        handle_timeout_ms=_finite_number(
-            payload["handle_timeout_ms"],
-            "ticket_handle_timeout_ms",
-            positive=True,
-        ),
-    )
-
-
-def _parse_transfer_ticket(value: Any) -> KVReturnTransferTicket:
-    payload = _object(
-        value,
-        "transfer_ticket",
-        {"nonce", "handle_nonce", "attempt_id", "deadline_ms"},
-    )
-    return KVReturnTransferTicket(
-        nonce=_string(
-            payload["nonce"],
-            "transfer_ticket_nonce",
-            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
-        ),
-        handle_nonce=_string(
-            payload["handle_nonce"],
-            "transfer_ticket_handle_nonce",
-            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
-        ),
-        attempt_id=_string(
-            payload["attempt_id"],
-            "transfer_ticket_attempt_id",
-            max_length=KV_RETURN_MAX_IDENTIFIER_LENGTH,
-        ),
         deadline_ms=_finite_number(
-            payload["deadline_ms"],
-            "transfer_ticket_deadline_ms",
-            positive=True,
+            payload["deadline_ms"], "ticket_deadline_ms", positive=True,
         ),
     )
 
@@ -721,7 +680,7 @@ def _string(value: Any, name: str, *, max_length: int) -> str:
 
 def _optional_string(
     value: Any, name: str, *, max_length: int,
-) -> str | None:
+) -> Optional[str]:
     if value is None:
         return None
     if not isinstance(value, str) or len(value) > max_length:
@@ -787,7 +746,6 @@ def _manager_response(result: KVReturnResult) -> web.Response:
         http_status,
         idempotent=result.idempotent,
         reserved_blocks=result.reserved_blocks,
-        transfer_ticket=result.transfer_ticket,
     )
 
 
@@ -798,7 +756,6 @@ def _control_response(
     *,
     idempotent: bool = False,
     reserved_blocks: int = 0,
-    transfer_ticket: Optional[KVReturnTransferTicket] = None,
 ) -> web.Response:
     payload = {
         "status": status,
@@ -806,8 +763,6 @@ def _control_response(
         "idempotent": idempotent,
         "reserved_blocks": reserved_blocks,
     }
-    if transfer_ticket is not None:
-        payload["transfer_ticket"] = asdict(transfer_ticket)
     return web.json_response(payload, status=http_status)
 
 
@@ -883,7 +838,7 @@ class BootstrapClient:
         port: int,
         prepare: KVReturnPrepare,
         *,
-        deadline: float | None = None,
+        deadline: Optional[float] = None,
     ) -> KVReturnControlResponse:
         payload = asdict(prepare)
         try:
@@ -908,11 +863,10 @@ class BootstrapClient:
         port: int,
         commit: KVReturnCommit,
         *,
-        deadline: float | None = None,
+        deadline: Optional[float] = None,
     ) -> KVReturnControlResponse:
         payload = {
             "prepare": asdict(commit.prepare),
-            "transfer_ticket": asdict(commit.transfer_ticket),
             "generated_token_ids": list(commit.generated_token_ids),
         }
         try:
@@ -937,7 +891,7 @@ class BootstrapClient:
         port: int,
         abort: KVReturnAbort,
         *,
-        deadline: float | None = None,
+        deadline: Optional[float] = None,
     ) -> KVReturnControlResponse:
         payload = asdict(abort)
         try:
@@ -964,7 +918,7 @@ class BootstrapClient:
         protocol_version: int,
         payload: Mapping[str, Any],
         *,
-        deadline: float | None,
+        deadline: Optional[float],
     ) -> KVReturnControlResponse:
         import aiohttp
 
@@ -994,7 +948,7 @@ class BootstrapClient:
             f"/kv-return/v{protocol_version}/{operation}"
         )
 
-        async def exchange() -> tuple[int, str, bytes]:
+        async def exchange() -> Tuple[int, str, bytes]:
             async with session.post(url, json=payload) as response:
                 if (
                     response.content_length is not None
@@ -1096,12 +1050,8 @@ def _parse_kv_return_response(
         raise KVReturnProtocolError(
             f"KV return {operation} response is not valid JSON"
         ) from exc
-    base_fields = {"status", "reason", "idempotent", "reserved_blocks"}
-    if (
-        not isinstance(payload, dict)
-        or not base_fields.issubset(payload)
-        or set(payload) - base_fields - {"transfer_ticket"}
-    ):
+    expected_fields = {"status", "reason", "idempotent", "reserved_blocks"}
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise KVReturnProtocolError(
             f"KV return {operation} response has the wrong fields"
         )
@@ -1111,15 +1061,6 @@ def _parse_kv_return_response(
         raise KVReturnProtocolError(
             f"KV return {operation} response has an unknown status"
         ) from exc
-    expected_fields = (
-        base_fields | {"transfer_ticket"}
-        if status == KVReturnControlStatus.READY
-        else base_fields
-    )
-    if set(payload) != expected_fields:
-        raise KVReturnProtocolError(
-            f"KV return {operation} response has the wrong fields"
-        )
     if http_status not in _KV_RETURN_HTTP_STATUSES[status]:
         raise KVReturnProtocolError(
             f"KV return {operation} response status disagrees with HTTP status"
@@ -1163,17 +1104,6 @@ def _parse_kv_return_response(
         raise KVReturnProtocolError(
             f"KV return {operation} rejection reserved unexpected blocks"
         )
-    if status == KVReturnControlStatus.READY:
-        try:
-            transfer_ticket = _parse_transfer_ticket(
-                payload["transfer_ticket"]
-            )
-        except _ControlInputError as exc:
-            raise KVReturnProtocolError(
-                "KV return prepare response has an invalid transfer ticket"
-            ) from exc
-    else:
-        transfer_ticket = None
     return KVReturnControlResponse(
         operation=operation,
         protocol_version=protocol_version,
@@ -1182,7 +1112,6 @@ def _parse_kv_return_response(
         reason=reason,
         idempotent=idempotent,
         reserved_blocks=reserved_blocks,
-        transfer_ticket=transfer_ticket,
     )
 
 

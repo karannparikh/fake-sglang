@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from copy import deepcopy
 import asyncio
 import json
 import time
-from contextlib import asynccontextmanager
-from copy import deepcopy
 from unittest.mock import AsyncMock
 
-import pytest
 from aiohttp import web
+import pytest
 
 from fakeengine.bootstrap import (
     BootstrapClient,
@@ -18,15 +18,16 @@ from fakeengine.bootstrap import (
     KVReturnTransportError,
 )
 from fakeengine.config import SimConfig
+from fakeengine.kvcache import block_hashes
 from fakeengine.kv_return import KVReturnResult, KVReturnStatus
 from fakeengine.kv_return_client import (
     KVReturnLeaseLostError,
     KVReturnOutcomeStatus,
     return_generated_kv,
 )
-from fakeengine.kvcache import block_hashes
 from fakeengine.scheduler import Scheduler
 from fakeengine.topology import TopologyError
+
 
 TOPOLOGY = {
     "levels": ["zone", "rack", "node"],
@@ -40,15 +41,15 @@ TOPOLOGY = {
 
 
 def _config(server_args, mode, **overrides):
-    settings = {
-        "disaggregation_mode": mode,
-        "enable_kv_return": True,
-        "fake_kv_return_max_tokens": 16,
-        "fake_kv_return_deadline_ms": 500,
-        "fake_kv_return_bytes_per_token": 32,
-        "fake_num_kv_blocks": 8,
-        "page_size": 4,
-    }
+    settings = dict(
+        disaggregation_mode=mode,
+        enable_kv_return=True,
+        fake_kv_return_max_tokens=16,
+        fake_kv_return_deadline_ms=500,
+        fake_kv_return_bytes_per_token=32,
+        fake_num_kv_blocks=8,
+        page_size=4,
+    )
     settings.update(overrides)
     return SimConfig.from_server_args(server_args(**settings))
 
@@ -402,7 +403,7 @@ class _BudgetPrepareServer(BootstrapServer):
         return await super()._prepare_kv_return(request)
 
 
-async def test_prepare_mints_a_fresh_transfer_budget(
+async def test_prepare_and_transfer_share_one_monotonic_budget(
     server_args,
     unused_port,
 ):
@@ -426,15 +427,15 @@ async def test_prepare_mints_a_fresh_transfer_budget(
         ) as server:
             metadata = _publish(server, scheduler, 45)
             metadata["ready_ts"] = time.time() + 86400
-            outcome = await return_generated_kv(
-                decode,
-                client,
-                host="127.0.0.1",
-                port=unused_port,
-                room_metadata=metadata,
-                generated_token_ids=(5, 6, 7, 8),
-            )
-            assert outcome.status == KVReturnOutcomeStatus.COMMITTED
+            with pytest.raises(TimeoutError, match="simulated"):
+                await return_generated_kv(
+                    decode,
+                    client,
+                    host="127.0.0.1",
+                    port=unused_port,
+                    room_metadata=metadata,
+                    generated_token_ids=(5, 6, 7, 8),
+                )
             assert scheduler.kv_return._attempts == {}
             assert scheduler.pool.can_allocate(scheduler.pool.num_blocks)
     finally:
@@ -496,7 +497,6 @@ class _WrongStatusPrepareServer(BootstrapServer):
                 "reason": "reservation_ready",
                 "idempotent": False,
                 "reserved_blocks": 1,
-                "transfer_ticket": {},
             },
             status=409,
         )
@@ -731,7 +731,7 @@ async def test_inconsistent_local_ticket_is_rejected_before_network(
     metadata = _publish(server, scheduler, 42)
     decode = _config(server_args, "decode")
     if mismatch == "protocol":
-        metadata["kv_return"]["compatibility"]["protocol_version"] = 3
+        metadata["kv_return"]["compatibility"]["protocol_version"] = 2
     else:
         decode.served_model_name = "other-model"
     client = BootstrapClient(0.001, 1)

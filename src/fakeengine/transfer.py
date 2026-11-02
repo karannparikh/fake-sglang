@@ -16,8 +16,7 @@ on a peer that is never coming.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, KVPoll
 
@@ -138,7 +137,7 @@ class KVSender:
         *,
         dp_rank: int,
         prompt_ids: Sequence[int],
-        cache_salt: str | None,
+        cache_salt: Optional[str],
     ) -> None:
         self.config = config
         self.server = server

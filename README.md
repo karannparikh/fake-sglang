@@ -75,11 +75,8 @@ without counting another cache observation.
 Enabled response return adds bounded `sglang:simulated_kv_return_` metrics for
 accepted attempts, stored responses, rejected and failed attempts by stable
 reason, returned tokens/bytes, transfer and commit time, active tasks, and
-retained blocks. `simulated_kv_return_claim_delay_seconds` measures from
-completed response generation to the retention-claim attempt and labels each
-observation as claimed, expired, released, already claimed, not registered, or
-invalid owner. The scheduler's KV occupancy and retention lease counters remain
-the source of truth; these metrics only report orchestration outcomes.
+retained blocks. The scheduler's KV occupancy and retention lease counters
+remain the source of truth; these metrics only report orchestration outcomes.
 
 `--enable-forward-pass-metrics` requires Dynamo's injected
 `--forward-pass-metrics-ipc-name` and `--forward-pass-metrics-worker-id`.
@@ -310,24 +307,24 @@ instead of adding the aggregated workers to the decode pool.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--fake-prefill-ms-per-1k-tokens` | 55.0 | Prefill cost per 1k recomputed tokens |
-| `--fake-prefill-overhead-ms` | 4.0 | Fixed per-prefill-step cost |
+| `--fake-timing-profile` | `auto` | Select `aggregated` for combined workers and `disaggregated` for prefill/decode roles; either profile may be forced |
+| `--fake-prefill-ms-per-1k-tokens` | profile default | Override prefill cost per 1k recomputed tokens |
+| `--fake-prefill-overhead-ms` | profile default | Override fixed per-prefill-step cost |
 | `--fake-kv-generation-ms-per-1k-tokens` | 0.0 | Additional K/V-generation cost for uncached prefill tokens |
-| `--fake-itl-ms` | 9.0 | Base inter-token latency |
-| `--fake-itl-ms-per-running-req` | 0.35 | ITL added per extra request in the batch |
+| `--fake-itl-ms` | profile default | Override batch-one ITL |
+| `--fake-itl-ms-per-running-req` | profile default | Override linear ITL adjustment per extra request |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
-| `--enable-kv-return` | false | Enable version-2 best-effort response-KV return on eligible prefill and decode workers |
-| `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return handle accepts |
-| `--fake-kv-return-handle-timeout-ms` | max(bootstrap timeout x 4000, 60000) | Lifetime of the handoff handle carried through decode |
-| `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Lifetime of the transfer ticket minted after prepare |
+| `--enable-kv-return` | false | Enable version-1 best-effort response-KV return on eligible prefill and decode workers |
+| `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return ticket accepts |
+| `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Return-ticket deadline in milliseconds |
 | `--fake-kv-return-bytes-per-token` | model-derived forward value | Reverse-transfer payload bytes per generated token |
 | `--fake-kv-return-bandwidth-gb-s` | forward KV bandwidth | Reverse-transfer bandwidth override |
 | `--fake-kv-return-overhead-ms` | forward transfer overhead | Fixed reverse-transfer overhead override |
 | `--fake-kv-return-retention-max-leases` | 32 | Maximum completed decode responses whose KV may remain retained |
 | `--fake-kv-return-retention-max-blocks` | all worker blocks | Maximum blocks held by completed-response retention leases |
 | `--fake-kv-return-retention-max-bytes` | retention block budget x block bytes | Maximum KV bytes held by completed-response retention leases |
-| `--fake-kv-return-retention-timeout-ms` | transfer-ticket deadline | Time before an unreleased completed-response lease expires |
+| `--fake-kv-return-retention-timeout-ms` | return-ticket deadline | Time before an unreleased completed-response lease expires |
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
@@ -336,6 +333,49 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-output-token-id` | unset | Emit one deterministic token ID for every generated token; useful for tokenizer round-trip-safe KV-return benchmarks |
 | `--fake-location` | unset | This worker's place in the network, e.g. `region-a/cluster-1/zone-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
+
+The timing defaults are calibrated from production observations of a
+**disaggregated prefill/decode deployment**. Four-value sequences below are
+interpreted as P50 / P90 / P95 / P99. Decode values are milliseconds; prefill
+values are seconds. Aggregated workers currently reuse these defaults unless
+their fake timing flags are overridden; these tables do not claim aggregated
+worker calibration. In `auto` mode, aggregated workers retain the original
+analytic defaults: `4 ms + 55 ms/1K` for prefill and
+`9 ms + 0.35 ms * (batch_size - 1)` for decode. Disaggregated prefill/decode
+roles use the calibrated defaults below. Explicit fake timing flags override
+the selected profile, and `--fake-timing-profile` can force either profile for
+controlled comparisons.
+
+| Disaggregated decode batch | Decode engine only | Including prefill-worker interruptions |
+|---:|---:|---:|
+| 1 | 3.6 / 6.2 / 7.0 / 8.4 | 3.8 / 9.1 / 26 / 90 |
+| 2 | 4.1 / 7.2 / 7.8 / 8.7 | 4.7 / 9.8 / 15 / 60 |
+| 4 | 6.2 / 8.0 / 8.5 / 9.7 | 7.2 / 13.8 / 21 / 64 |
+| 8 | 7.5 / 8.8 / 9.3 / 11.7 | 8.9 / 21.6 / 34 / 104 |
+| 16 | 8.6 / 10.0 / 10.4 / 12.0 | 11.4 / 36 / 66 / 232 |
+| 24 | 9.8 / 11.0 / 11.4 / 12.9 | 13.6 / 53 / 111 / 376 |
+| 32 | 10.4 / 12.0 / 12.7 / 14.8 | 15.0 / 54 / 102 / 412 |
+
+The simulator linearly interpolates the engine-only decode P50 anchors.
+Prefill interruptions are not added to every decode step; they emerge when the
+prefill-priority scheduler delays active decode work.
+
+| Disaggregated prefill context | Prefill engine only | Disaggregated TTFT, all | Disaggregated TTFT P50, no cache hit |
+|---:|---:|---:|---:|
+| 0-1K | n/a | 0.35 / 1.3 / 3.1 / 9.4 | 0.35 |
+| 1K-4K | n/a | 0.43 / 1.2 / 2.1 / 12.9 | 0.43 |
+| 4K-8K | n/a | 0.52 / 1.3 / 2.1 / 14.3 | 0.58 |
+| 8K-16K | n/a | 0.68 / 1.4 / 2.1 / 15.7 | 0.99 |
+| 16K-32K | 0.26 / 2.0 / 5.0 / 17 | 1.19 / 2.3 / 3.2 / 16.2 | 1.57 |
+| 32K-64K | 1.05 / 3.0 / 5.4 / 16 | 1.80 / 3.5 / 4.6 / 19.3 | 2.79 |
+| 64K-128K | 2.45 / 5.3 / 6.8 / 21 | 2.34 / 6.0 / 7.3 / 25.7 | 5.13 |
+| 128K-256K | 6.5 / 14.8 / 22 / 57 | 2.66 / 13.7 / 16.2 / 40.7 | 10.6 |
+| 256K+ | 19 / 46 / 73 / 124 | 4.2 / 38.9 / 60.3 / 104 | 25.7 |
+
+The default `320 ms + 55 ms/1K recomputed tokens` prefill fit targets the
+no-cache P50 column at representative bucket midpoints. The higher percentiles
+and interruption-inclusive decode values remain validation targets rather than
+deterministic costs, so the scheduler does not double-count queueing.
 
 Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots. The
 default `--page-size` is 256 and the default `--context-length` is 1,048,576.
@@ -352,22 +392,7 @@ transferred KV on a prebuilt decode request. Each prefill step still pays its
 fixed overhead, and `--fake-speedup-ratio` divides the entire sleep.
 Decode and topology-dependent transfer costs are unchanged.
 
-With `--fake-output-len-median` set, each answer also has a natural length,
-drawn from a lognormal with that median and `--fake-output-len-sigma`. The
-mean is `median * exp(sigma^2 / 2)`, so median 150 and sigma 1.47 give a mean
-of about 442 tokens. The draw is seeded by the prompt, so the same prompt
-stops at the same token in aggregated and disaggregated serving. A request
-that reaches its natural length finishes with `stop`, the way a real answer
-ends on EOS. One that hits `max_new_tokens` first still finishes with
-`length`. `ignore_eos` turns the natural length off for that request, and
-`min_new_tokens` is a floor under it, as in SGLang.
-
-Set `--fake-output-token-id` to replace the deterministic pseudo-random token
-stream with one repeated in-vocabulary token. The caller is responsible for
-choosing a token that survives decode/re-tokenization for the selected
-tokenizer; token `264` is used by the Qwen3 KV-return lab.
-
-KV return limits, handle/transfer deadlines, bandwidth and byte-size overrides must be finite
+KV return limits, deadlines, bandwidth and byte-size overrides must be finite
 and positive; token limits and byte sizes must also be integers. Transfer
 overheads must be finite and nonnegative, so zero remains valid for both
 forward and reverse transfers. The bootstrap timeout must be finite and
@@ -379,7 +404,7 @@ existing forward-transfer or model-derived values.
 
 Eligible normal decode completion now uses the existing typed retention lease
 automatically. Eligibility requires decode mode, local `--enable-kv-return`,
-radix caching, a real peer, and a valid server-issued room handle whose
+radix caching, a real peer, and a valid server-issued room ticket whose
 compatibility, prefill rank, room, and `cache_salt` match the decode request.
 No ticket is inferred from a request or session ID. For block size `B`, prompt
 length `P`, and generated length `G`, the lease owns block indices
@@ -394,11 +419,25 @@ the lease: generic idle expiry and abort controls cannot free a claimed lease,
 and only its background task can release it. The claim receives a fresh
 `--fake-kv-return-retention-timeout-ms` task deadline, which bounds terminal
 handoff plus prepare/transfer/commit. Count, block, and byte budgets decline
-only the retention optimization; the completed model response still succeeds
-and its terminal output does not wait for release. Aborted, failed, or
-disconnected-before-terminal requests never schedule returns. Retained
-prebuilt decode blocks are not inserted into the decode cache and do not
-publish local KV store events.
+only the optimization; the completed model response still succeeds. Aborted,
+failed, or disconnected-before-terminal requests never schedule returns.
+Retained prebuilt decode blocks are not inserted into the decode cache and do
+not publish local KV store events.
+
+With `--fake-output-len-median` set, each answer also has a natural length,
+drawn from a lognormal with that median and `--fake-output-len-sigma`. The
+mean is `median * exp(sigma^2 / 2)`, so median 150 and sigma 1.47 give a mean
+of about 442 tokens. The draw is seeded by the prompt, so the same prompt
+stops at the same token in aggregated and disaggregated serving. A request
+that reaches its natural length finishes with `stop`, the way a real answer
+ends on EOS. One that hits `max_new_tokens` first still finishes with
+`length`. `ignore_eos` turns the natural length off for that request, and
+`min_new_tokens` is a floor under it, as in SGLang.
+
+Set `--fake-output-token-id` to replace the deterministic pseudo-random token
+stream with one repeated in-vocabulary token. The caller is responsible for
+choosing a token that survives decode/re-tokenization for the selected
+tokenizer; token `264` is used by the Qwen3 KV-return lab.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
@@ -452,30 +491,27 @@ requests never publish `kv_return` metadata.
 `--enable-kv-return` is disabled by default and must be enabled on both
 workers. On a real disaggregated prefill room with radix caching enabled, the
 bootstrap server asks that rank's return manager to issue the `kv_return`
-handle placed in room metadata. The handle has an unguessable nonce and
-attempt ID, exact room and prefill DP rank, cache namespace, token/byte limits,
-its own bounded lifetime, and the complete model/KV compatibility contract.
-It does not spend the transfer deadline while decode generates tokens. No
-session ID is used.
+ticket placed in room metadata. The ticket has an unguessable nonce and
+attempt ID, exact room and prefill DP rank, cache namespace,
+token/byte/deadline limits, and the complete model/KV compatibility contract.
+No session ID is used.
 
 The prefill bootstrap HTTP server exposes the manager lifecycle directly:
 
 ```
-POST /kv-return/v2/prepare  -> reserves clean capacity and returns a fresh transfer ticket
-POST /kv-return/v2/commit   -> validates that ticket and atomically imports the token tail
-POST /kv-return/v2/abort    -> releases an issued or prepared attempt
+POST /kv-return/v1/prepare  -> READY only after clean capacity is reserved
+POST /kv-return/v1/commit   -> atomically imports the validated token tail
+POST /kv-return/v1/abort    -> releases an issued or prepared attempt
 ```
 
-Prepare carries the complete handoff handle and exact generated-token controls.
-Its success response mints a nonce-bound, short-lived transfer ticket; commit
-must present that exact ticket with the token payload. JSON fields and types
-are strict, request and token-array sizes are bounded, and stable status/reason
-bodies distinguish malformed input, missing or expired handles/tickets,
+Each operation carries the complete ticket and attempt controls. JSON fields
+and types are strict, request and token-array sizes are bounded, and stable
+status/reason bodies distinguish malformed input, missing or expired tickets,
 compatibility mismatch, capacity rejection, checksum/token failure and import
 failure. Exact duplicate requests preserve the manager's idempotent result.
 The existing bootstrap sweeper expires manager attempts; an unclaimed room's
-expiry clears its active or terminal state, and server shutdown releases all
-reservations and idempotency records.
+expiry clears its active or terminal ticket state, and server shutdown releases
+all reservations and idempotency records.
 
 `BootstrapClient` now has strict typed prepare, commit, and abort operations,
 and `fakeengine.kv_return_client.return_generated_kv` can execute one explicit

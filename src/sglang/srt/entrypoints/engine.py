@@ -426,7 +426,7 @@ class Engine:
         min_new = int(params.get("min_new_tokens") or 0)
         request_id = str(rid or uuid.uuid4().hex)
         if not isinstance(retain_response_kv, bool):
-            raise TypeError("retain_response_kv must be a boolean")
+            raise ValueError("retain_response_kv must be a boolean")
 
         return self._generate_stream(
             request_id=request_id,
@@ -438,9 +438,9 @@ class Engine:
             cache_salt=_single_salt(cache_salt),
             scheduler=self.schedulers[rank],
             dp_rank=rank,
+            retain_response_kv=retain_response_kv,
             ignore_eos=ignore_eos,
             min_new_tokens=min_new,
-            retain_response_kv=retain_response_kv,
         )
 
     def _resolve_routed_dp_rank(
@@ -503,9 +503,9 @@ class Engine:
         scheduler: Scheduler,
         dp_rank: int,
         cache_salt: Optional[str] = None,
+        retain_response_kv: bool = False,
         ignore_eos: bool = False,
         min_new_tokens: int = 0,
-        retain_response_kv: bool = False,
     ) -> AsyncIterator[dict]:
         mode = self.disaggregation_mode
         started = time.monotonic()
@@ -521,9 +521,9 @@ class Engine:
                 started,
                 scheduler,
                 cache_salt,
+                retain_response_kv,
                 ignore_eos,
                 min_new_tokens,
-                retain_response_kv,
             )) as stream:
                 async for chunk in stream:
                     yield chunk
@@ -578,10 +578,10 @@ class Engine:
         bootstrap_room: int,
         started: float,
         scheduler: Scheduler,
-        cache_salt: str | None,
+        cache_salt: Optional[str],
+        retain_response_kv: bool,
         ignore_eos: bool = False,
         min_new_tokens: int = 0,
-        retain_response_kv: bool = False,
     ) -> AsyncIterator[dict]:
         """Wait for the peer's KV, then decode from a prebuilt batch."""
         receiver = KVReceiver(
@@ -616,9 +616,9 @@ class Engine:
             prebuilt=True,
             first_token=handoff,
             cache_salt=cache_salt,
+            retain_response_kv=attempt is not None or retain_response_kv,
             ignore_eos=ignore_eos,
             min_new_tokens=min_new_tokens,
-            retain_response_kv=attempt is not None or retain_response_kv,
         )
         scheduler.submit(request)
         terminal_delivered = False

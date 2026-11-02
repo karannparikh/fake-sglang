@@ -32,7 +32,6 @@ from fakeengine.kv_return import (
     KVReturnCommit,
     KVReturnPrepare,
     KVReturnTicket,
-    KVReturnTransferTicket,
     kv_return_checksum,
     kv_return_compatibility,
 )
@@ -55,7 +54,7 @@ class KVReturnControlClient(Protocol):
         port: int,
         prepare: KVReturnPrepare,
         *,
-        deadline: float | None = None,
+        deadline: Optional[float] = None,
     ) -> KVReturnControlResponse:
         ...
 
@@ -65,7 +64,7 @@ class KVReturnControlClient(Protocol):
         port: int,
         commit: KVReturnCommit,
         *,
-        deadline: float | None = None,
+        deadline: Optional[float] = None,
     ) -> KVReturnControlResponse:
         ...
 
@@ -75,7 +74,7 @@ class KVReturnControlClient(Protocol):
         port: int,
         abort: KVReturnAbort,
         *,
-        deadline: float | None = None,
+        deadline: Optional[float] = None,
     ) -> KVReturnControlResponse:
         ...
 
@@ -146,7 +145,10 @@ async def return_generated_kv(
     generated = validate_kv_return_generated(
         config, context, generated_token_ids,
     )
-    deadline = started_at + client.timeout_s
+    deadline = started_at + min(
+        client.timeout_s,
+        _ticket_budget_s(ticket),
+    )
     if task_deadline is not None:
         if (
             isinstance(task_deadline, bool)
@@ -159,7 +161,7 @@ async def return_generated_kv(
         deadline = min(deadline, float(task_deadline))
     _require_source_ownership(owns_source)
     if deadline <= time.monotonic():
-        raise TimeoutError("KV return task deadline expired before prepare")
+        raise TimeoutError("KV return ticket expired before prepare")
 
     prepare = KVReturnPrepare(
         ticket=ticket,
@@ -218,30 +220,6 @@ async def return_generated_kv(
             link=None,
             prepare_response=prepared,
         )
-    transfer_ticket = prepared.transfer_ticket
-    if transfer_ticket is None:
-        await _best_effort_abort(client, host, port, ticket)
-        raise KVReturnProtocolError(
-            "KV return prepare response omitted its transfer ticket"
-        )
-    if (
-        transfer_ticket.handle_nonce != ticket.nonce
-        or transfer_ticket.attempt_id != ticket.attempt_id
-    ):
-        await _best_effort_abort(client, host, port, ticket)
-        raise KVReturnProtocolError(
-            "KV return transfer ticket does not match its handoff handle"
-        )
-    try:
-        deadline = time.monotonic() + min(
-            client.timeout_s,
-            _transfer_ticket_budget_s(transfer_ticket),
-        )
-    except BaseException:
-        await _best_effort_abort(client, host, port, ticket)
-        raise
-    if task_deadline is not None:
-        deadline = min(deadline, float(task_deadline))
 
     try:
         _require_source_ownership(owns_source)
@@ -277,7 +255,7 @@ async def return_generated_kv(
         committed = await client.commit_kv_return(
             host,
             port,
-            KVReturnCommit(prepare, transfer_ticket, generated),
+            KVReturnCommit(prepare, generated),
             deadline=deadline,
         )
         _require_source_ownership(owns_source)
@@ -410,20 +388,19 @@ def _require_source_ownership(
         )
 
 
-def _transfer_ticket_budget_s(ticket: KVReturnTransferTicket) -> float:
+def _ticket_budget_s(ticket: KVReturnTicket) -> float:
     budget = ticket.deadline_ms / 1000.0
     if not math.isfinite(budget) or budget <= 0:
         raise KVReturnProtocolError(
-            "KV return transfer-ticket deadline must be a finite positive "
-            "duration"
+            "KV return ticket deadline must be a finite positive duration"
         )
     return budget
 
 
 def _reverse_link(
     config: SimConfig,
-    prefill_location: str | None,
-) -> Link | None:
+    prefill_location: Optional[str],
+) -> Optional[Link]:
     topology = config.topology
     if topology is None or not config.location or not prefill_location:
         return None
@@ -444,7 +421,7 @@ async def _best_effort_abort(
             KVReturnAbort(ticket, ticket.attempt_id),
             deadline=time.monotonic() + cleanup_timeout,
         )
-    except BaseException as exc:  # noqa: BLE001 - cleanup includes cancellation
+    except BaseException as exc:
         logger.debug(
             "fake-sglang: best-effort KV return abort failed (%s)",
             type(exc).__name__,

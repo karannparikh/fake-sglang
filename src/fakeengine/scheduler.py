@@ -19,14 +19,13 @@ occupy blocks. SGLang calls the same thing ``prepare_for_prebuilt`` /
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import logging
 import math
 import time
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass, field
 from statistics import pvariance
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.observability.forward_pass_metrics import (
     QueuedRequestMetrics,
@@ -87,25 +86,16 @@ _KV_RETURN_FAILURE_REASONS = frozenset({
     "cancelled",
     "unexpected",
 })
-_KV_RETURN_CLAIM_RESULTS = frozenset({
-    "claimed",
-    "expired",
-    "released",
-    "already_claimed",
-    "not_registered",
-    "invalid_owner",
-    "other",
-})
 
 
 @dataclass
 class PrefixImportReservation:
-    prompt_ids: tuple[int, ...]
+    prompt_ids: Tuple[int, ...]
     max_generated_tokens: int
-    cache_salt: str | None
+    cache_salt: Optional[str]
     _owner: object
-    _prefix_blocks: list[int]
-    _reserved_blocks: list[int]
+    _prefix_blocks: List[int]
+    _reserved_blocks: List[int]
     _active: bool = True
 
     @property
@@ -116,11 +106,11 @@ class PrefixImportReservation:
 @dataclass
 class _KVRetentionState:
     released: bool = False
-    released_at: float | None = None
-    release_reason: str | None = None
-    claim_token: object | None = None
-    claimed_at: float | None = None
-    claim_deadline: float | None = None
+    released_at: Optional[float] = None
+    release_reason: Optional[str] = None
+    claim_token: Optional[object] = None
+    claimed_at: Optional[float] = None
+    claim_deadline: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -129,11 +119,11 @@ class KVRetentionLease:
     request_id: str
     prompt_token_count: int
     generated_token_count: int
-    generated_token_ids: tuple[int, ...] = field(repr=False)
-    block_ids: tuple[int, ...]
+    generated_token_ids: Tuple[int, ...] = field(repr=False)
+    block_ids: Tuple[int, ...]
     block_count: int
     retained_bytes: int
-    cache_salt: str | None
+    cache_salt: Optional[str]
     created_at: float
     deadline: float
     _owner: object = field(repr=False, compare=False)
@@ -148,11 +138,11 @@ class KVRetentionLease:
         return self._state.released
 
     @property
-    def released_at(self) -> float | None:
+    def released_at(self) -> Optional[float]:
         return self._state.released_at
 
     @property
-    def release_reason(self) -> str | None:
+    def release_reason(self) -> Optional[str]:
         return self._state.release_reason
 
     @property
@@ -175,13 +165,13 @@ class KVRetentionClaim:
 
 class Request:
     __slots__ = (
-        "_cache_observed", "_generated_token_ids", "_hashes",
-        "_original_prompt_token_count", "_output_event", "_output_ready",
+        "_cache_observed", "_hashes", "_output_event", "_output_ready",
         "_output_reason", "_output_started", "_output_tokens", "_stream",
+        "_original_prompt_token_count", "_generated_token_ids",
         "arrival", "blocks", "cache_salt", "cached_tokens", "finished",
         "first_token", "generated", "ignore_eos", "max_new_tokens",
-        "min_new_tokens", "observe_cache", "prebuilt", "prefilled",
-        "prompt_ids", "retain_response_kv", "retention_lease",
+        "min_new_tokens", "observe_cache", "prebuilt",
+        "prefilled", "prompt_ids", "retain_response_kv", "retention_lease",
         "retention_rejection_reason", "rid", "stop_after",
     )
 
@@ -195,9 +185,9 @@ class Request:
         first_token: Optional[int] = None,
         cache_salt: Optional[str] = None,
         observe_cache: bool = True,
+        retain_response_kv: bool = False,
         ignore_eos: bool = False,
         min_new_tokens: int = 0,
-        retain_response_kv: bool = False,
     ) -> None:
         if not isinstance(retain_response_kv, bool):
             raise TypeError("retain_response_kv must be a boolean")
@@ -229,10 +219,10 @@ class Request:
         self._output_started = False
         self._output_event = asyncio.Event()
         self.retain_response_kv = retain_response_kv
-        self.retention_lease: KVRetentionLease | None = None
-        self.retention_rejection_reason: str | None = None
+        self.retention_lease: Optional[KVRetentionLease] = None
+        self.retention_rejection_reason: Optional[str] = None
         self._original_prompt_token_count = len(self.prompt_ids)
-        self._generated_token_ids: list[int] = []
+        self._generated_token_ids: List[int] = []
 
     @property
     def total_tokens(self) -> int:
@@ -312,7 +302,7 @@ class Scheduler:
         cache_metrics: Optional[PrefixCacheMetrics] = None,
         *,
         dp_rank: int = 0,
-        clock: Callable[[], float] | None = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.config = config
         self.dp_rank = dp_rank
@@ -346,8 +336,8 @@ class Scheduler:
         self._prefix_import_owner = object()
         self.kv_return = KVReturnManager(self, dp_rank)
         self._retention_owner = object()
-        self._retention_leases: dict[str, KVRetentionLease] = {}
-        self._retention_by_request: dict[str, str] = {}
+        self._retention_leases: Dict[str, KVRetentionLease] = {}
+        self._retention_by_request: Dict[str, str] = {}
         self._retained_blocks = 0
         self._retained_bytes = 0
         self._retention_rejections = 0
@@ -439,13 +429,13 @@ class Scheduler:
     # -- completed decode retention ---------------------------------------
 
     @property
-    def active_retention_leases(self) -> tuple[KVRetentionLease, ...]:
+    def active_retention_leases(self) -> Tuple[KVRetentionLease, ...]:
         self.expire_retention_leases()
         return tuple(self._retention_leases.values())
 
     def get_retention_lease(
         self, request_id: str,
-    ) -> KVRetentionLease | None:
+    ) -> Optional[KVRetentionLease]:
         self.expire_retention_leases()
         lease_id = self._retention_by_request.get(request_id)
         if lease_id is None:
@@ -458,7 +448,7 @@ class Scheduler:
         *,
         claim: Optional[KVRetentionClaim] = None,
         reason: str = "released",
-        now: float | None = None,
+        now: Optional[float] = None,
     ) -> bool:
         if (
             not isinstance(lease, KVRetentionLease)
@@ -483,11 +473,11 @@ class Scheduler:
         if active is not lease:
             return False
 
-        lease._state.released = True
-        lease._state.released_at = (
+        lease._state.released = True                        # noqa: SLF001
+        lease._state.released_at = (                        # noqa: SLF001
             self._clock() if now is None else now
         )
-        lease._state.release_reason = reason
+        lease._state.release_reason = reason                 # noqa: SLF001
         self._retention_leases.pop(lease.lease_id, None)
         if self._retention_by_request.get(lease.request_id) == lease.lease_id:
             self._retention_by_request.pop(lease.request_id, None)
@@ -501,27 +491,22 @@ class Scheduler:
         self,
         lease: KVRetentionLease,
         *,
-        now: float | None = None,
-    ) -> KVRetentionClaim | None:
-        if not isinstance(lease, KVRetentionLease):
+        now: Optional[float] = None,
+    ) -> Optional[KVRetentionClaim]:
+        if (
+            not isinstance(lease, KVRetentionLease)
+            or lease._owner is not self._retention_owner
+        ):
             return None
         current = self._clock() if now is None else now
-        delay_seconds = max(current - lease.created_at, 0.0)
-        if lease._owner is not self._retention_owner:
-            self.record_kv_return_claim_delay(delay_seconds, "invalid_owner")
-            return None
-        if lease.released:
-            self.record_kv_return_claim_delay(delay_seconds, "released")
-            return None
-        if lease._state.claim_token is not None:                 # noqa: SLF001
-            self.record_kv_return_claim_delay(delay_seconds, "already_claimed")
-            return None
-        if self._retention_leases.get(lease.lease_id) is not lease:
-            self.record_kv_return_claim_delay(delay_seconds, "not_registered")
+        if (
+            lease.released
+            or lease._state.claim_token is not None              # noqa: SLF001
+            or self._retention_leases.get(lease.lease_id) is not lease
+        ):
             return None
         if lease.deadline <= current:
             self.release_retention(lease, reason="expired", now=current)
-            self.record_kv_return_claim_delay(delay_seconds, "expired")
             return None
 
         token = object()
@@ -532,7 +517,6 @@ class Scheduler:
         lease._state.claim_token = token                          # noqa: SLF001
         lease._state.claimed_at = current                         # noqa: SLF001
         lease._state.claim_deadline = deadline                    # noqa: SLF001
-        self.record_kv_return_claim_delay(delay_seconds, "claimed")
         return KVRetentionClaim(
             lease,
             current,
@@ -551,7 +535,7 @@ class Scheduler:
             and claim.lease._state.claim_token is claim._token   # noqa: SLF001
         )
 
-    def expire_retention_leases(self, now: float | None = None) -> int:
+    def expire_retention_leases(self, now: Optional[float] = None) -> int:
         current = self._clock() if now is None else now
         expired = [
             lease
@@ -568,8 +552,8 @@ class Scheduler:
         self,
         prompt_ids: Sequence[int],
         max_generated_tokens: int,
-        cache_salt: str | None = None,
-    ) -> PrefixImportReservation | None:
+        cache_salt: Optional[str] = None,
+    ) -> Optional[PrefixImportReservation]:
         """Hold clean blocks for a future prompt-plus-response prefix."""
         self.expire_retention_leases()
         prompt = tuple(prompt_ids)
@@ -730,15 +714,6 @@ class Scheduler:
         if self.cache_metrics is not None:
             self.cache_metrics.record_kv_return_failed(bounded)
 
-    def record_kv_return_claim_delay(
-        self,
-        seconds: float,
-        result: str,
-    ) -> None:
-        bounded = result if result in _KV_RETURN_CLAIM_RESULTS else "other"
-        if self.cache_metrics is not None:
-            self.cache_metrics.record_kv_return_claim_delay(seconds, bounded)
-
     def _publish_kv_return_state(self) -> None:
         if self.cache_metrics is not None:
             self.cache_metrics.update_kv_return(
@@ -859,8 +834,8 @@ class Scheduler:
                 self.config.stream_interval,
             )
 
-    def _idle_wait_timeout(self) -> float | None:
-        timeouts: list[float] = []
+    def _idle_wait_timeout(self) -> Optional[float]:
+        timeouts: List[float] = []
         if self.fpm is not None:
             timeouts.append(1.0)
         idle_leases = [
@@ -998,7 +973,7 @@ class Scheduler:
             token = self._next_token(request)
             request.generated.append(token)
             if request.retain_response_kv:
-                request._generated_token_ids.append(token)
+                request._generated_token_ids.append(token)      # noqa: SLF001
 
             finish_reason = None
             if len(request.generated) >= request.max_new_tokens:
@@ -1096,27 +1071,25 @@ class Scheduler:
         # prefill left off instead of repeating it.
         drawn = self._next_token(request)
         token = request.first_token if request.first_token is not None else drawn
-        will_finish = (
-            len(request.generated) + 1 >= request.max_new_tokens
-            or (
-                request.stop_after is not None
-                and len(request.generated) + 1 >= request.stop_after
-            )
-            or request.total_tokens + 1 >= self.config.context_len
-        )
-        if will_finish:
+        next_generated_count = len(request.generated) + 1
+        finish_reason = None
+        if next_generated_count >= request.max_new_tokens:
+            finish_reason = FINISH_LENGTH
+        elif (
+            request.stop_after is not None
+            and next_generated_count >= request.stop_after
+        ):
+            finish_reason = FINISH_STOP
+        elif request.total_tokens + 1 >= self.config.context_len:
+            finish_reason = FINISH_LENGTH
+        if finish_reason is not None:
             self._prepare_retention_capacity(
                 request,
-                len(request._generated_token_ids) + 1,
+                len(request._generated_token_ids) + 1,          # noqa: SLF001
             )
         request.generated.append(token)
         if request.retain_response_kv:
-            request._generated_token_ids.append(token)
-        finish_reason = None
-        if len(request.generated) >= request.max_new_tokens:
-            finish_reason = FINISH_LENGTH
-        elif self._reached_natural_end(request):
-            finish_reason = FINISH_STOP
+            request._generated_token_ids.append(token)          # noqa: SLF001
         if finish_reason is not None:
             self._complete(request, finish_reason)
         return RequestOutput(request, (token,), finish_reason)
@@ -1175,19 +1148,19 @@ class Scheduler:
             return
         if stop > len(request.blocks) and not self._grow_blocks(
             request,
-            request._original_prompt_token_count + generated_token_count,
+            request._original_prompt_token_count + generated_token_count,  # noqa: SLF001
         ):
             request.retention_rejection_reason = "capacity"
 
     def _retention_shape(
         self, request: Request, generated_token_count: int,
-    ) -> tuple[str | None, int, int, int, int]:
+    ) -> Tuple[Optional[str], int, int, int, int]:
         self.expire_retention_leases()
         block_size = self.config.block_size
-        start = request._original_prompt_token_count // block_size
+        start = request._original_prompt_token_count // block_size  # noqa: SLF001
         stop = math.ceil(
             (
-                request._original_prompt_token_count
+                request._original_prompt_token_count               # noqa: SLF001
                 + generated_token_count
             )
             / block_size
@@ -1215,7 +1188,7 @@ class Scheduler:
 
     def _retain_completed_response(
         self, request: Request,
-    ) -> KVRetentionLease | None:
+    ) -> Optional[KVRetentionLease]:
         if (
             not request.prebuilt
             or not request.retain_response_kv
@@ -1225,7 +1198,7 @@ class Scheduler:
                 self._retention_rejections += 1
             return None
 
-        generated_token_ids = tuple(request._generated_token_ids)
+        generated_token_ids = tuple(request._generated_token_ids)  # noqa: SLF001
         rejection, start, stop, block_count, retained_bytes = (
             self._retention_shape(request, len(generated_token_ids))
         )
@@ -1246,7 +1219,7 @@ class Scheduler:
         lease = KVRetentionLease(
             lease_id=uuid.uuid4().hex,
             request_id=request.rid,
-            prompt_token_count=request._original_prompt_token_count,
+            prompt_token_count=request._original_prompt_token_count,  # noqa: SLF001
             generated_token_count=len(generated_token_ids),
             generated_token_ids=generated_token_ids,
             block_ids=block_ids,

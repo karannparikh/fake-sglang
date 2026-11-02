@@ -176,14 +176,14 @@ class BlockPool:
         self._notify_evicted(evicted)
         return blocks
 
-    def allocate_clean(self, count: int) -> list[int] | None:
+    def allocate_clean(self, count: int) -> Optional[List[int]]:
         """Reserve clean blocks without evicting reusable prefixes."""
         if count < 0 or count > len(self._free_clean):
             return None
         if count == 0:
             return []
 
-        blocks: list[int] = []
+        blocks: List[int] = []
         for _ in range(count):
             block = self._free_clean.pop()
             self._free_clean_set.discard(block)
@@ -227,7 +227,7 @@ class BlockPool:
 
     def acquire_prefix(
         self, hashes: Sequence[bytes], *, touch: bool = True,
-    ) -> list[int]:
+    ) -> List[int]:
         """Match a prefix and take a reference on every block it hits.
 
         Sharing the blocks is what makes a cache hit real: the request pays no
@@ -235,7 +235,7 @@ class BlockPool:
         being evicted underneath it. Matching without acquiring would report a
         hit and then let the next allocation invalidate it.
         """
-        acquired: list[int] = []
+        acquired: List[int] = []
         for digest in hashes:
             block = self._cached.get(digest)
             if block is None:
@@ -284,12 +284,12 @@ class BlockPool:
 
     def insert_prefix_atomic(
         self, hashes: Sequence[bytes], blocks: Sequence[int]
-    ) -> list[tuple[int, bytes]] | None:
+    ) -> Optional[List[Tuple[int, bytes]]]:
         """Insert a complete prefix only when every mapping is compatible."""
         if len(hashes) != len(blocks):
             return None
 
-        assigned: dict[int, bytes] = {}
+        assigned: Dict[int, bytes] = {}
         saw_new = False
         for index, (digest, block) in enumerate(zip(hashes, blocks)):
             expected_parent = hashes[index - 1] if index else None

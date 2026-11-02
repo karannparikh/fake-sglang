@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
+from enum import Enum
 import hashlib
 import json
 import math
 import secrets
 import time
-from collections import OrderedDict
-from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
-from enum import Enum
-from typing import TYPE_CHECKING
+from typing import Callable, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from fakeengine.config import SimConfig
@@ -58,25 +57,13 @@ class KVReturnCompatibility:
 
 @dataclass(frozen=True)
 class KVReturnTicket:
-    """Durable handoff capability for one response-KV return."""
-
     nonce: str
     room_id: int
     attempt_id: str
     compatibility: KVReturnCompatibility
-    cache_salt: str | None
+    cache_salt: Optional[str]
     max_generated_tokens: int
     max_payload_bytes: int
-    handle_timeout_ms: float
-
-
-@dataclass(frozen=True)
-class KVReturnTransferTicket:
-    """Short-lived commit capability minted after prepare."""
-
-    nonce: str
-    handle_nonce: str
-    attempt_id: str
     deadline_ms: float
 
 
@@ -86,7 +73,7 @@ class KVReturnPrepare:
     attempt_id: str
     prefill_dp_rank: int
     compatibility_fingerprint: str
-    cache_salt: str | None
+    cache_salt: Optional[str]
     generated_token_count: int
     claimed_payload_bytes: int
     token_ids_checksum: str
@@ -95,8 +82,7 @@ class KVReturnPrepare:
 @dataclass(frozen=True)
 class KVReturnCommit:
     prepare: KVReturnPrepare
-    transfer_ticket: KVReturnTransferTicket
-    generated_token_ids: tuple[int, ...]
+    generated_token_ids: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -108,17 +94,16 @@ class KVReturnAbort:
 @dataclass(frozen=True)
 class KVReturnResult:
     status: KVReturnStatus
-    ticket: KVReturnTicket | None = None
-    transfer_ticket: KVReturnTransferTicket | None = None
+    ticket: Optional[KVReturnTicket] = None
     reserved_blocks: int = 0
     idempotent: bool = False
 
 
 def kv_return_compatibility(
-    config: SimConfig,
+    config: "SimConfig",
     prefill_dp_rank: int,
     *,
-    kv_layout_fingerprint: str | None = None,
+    kv_layout_fingerprint: Optional[str] = None,
 ) -> KVReturnCompatibility:
     """Build the shared compatibility contract for either side of a return."""
     return KVReturnCompatibility(
@@ -140,19 +125,18 @@ def kv_return_compatibility(
 @dataclass
 class _Attempt:
     ticket: KVReturnTicket
-    prompt_ids: tuple[int, ...]
+    prompt_ids: Tuple[int, ...]
     expires_at: float
-    prepare: KVReturnPrepare | None = None
-    transfer_ticket: KVReturnTransferTicket | None = None
-    reservation: PrefixImportReservation | None = None
+    prepare: Optional[KVReturnPrepare] = None
+    reservation: Optional["PrefixImportReservation"] = None
 
 
 @dataclass(frozen=True)
 class _Terminal:
     status: KVReturnStatus
     ticket: KVReturnTicket
-    prepare_key: str | None
-    commit_key: str | None
+    prepare_key: Optional[str]
+    commit_key: Optional[str]
     expires_at: float
 
 
@@ -165,10 +149,10 @@ class KVReturnManager:
 
     def __init__(
         self,
-        scheduler: Scheduler,
+        scheduler: "Scheduler",
         dp_rank: int,
         *,
-        kv_layout_fingerprint: str | None = None,
+        kv_layout_fingerprint: Optional[str] = None,
         terminal_ttl_s: float = DEFAULT_TERMINAL_TTL_S,
         max_terminal_records: int = DEFAULT_MAX_TERMINAL_RECORDS,
         clock: Callable[[], float] = time.monotonic,
@@ -195,16 +179,16 @@ class KVReturnManager:
             dp_rank,
             kv_layout_fingerprint=kv_layout_fingerprint,
         )
-        self._attempts: dict[str, _Attempt] = {}
-        self._terminal: OrderedDict[str, _Terminal] = OrderedDict()
+        self._attempts: Dict[str, _Attempt] = {}
+        self._terminal: "OrderedDict[str, _Terminal]" = OrderedDict()
 
     def issue_ticket(
         self,
         room_id: int,
         prompt_ids: Sequence[int],
-        cache_salt: str | None = None,
+        cache_salt: Optional[str] = None,
         *,
-        attempt_id: str | None = None,
+        attempt_id: Optional[str] = None,
     ) -> KVReturnResult:
         """Issue a local ticket for one eligible prefill room."""
         self.expire()
@@ -245,11 +229,11 @@ class KVReturnManager:
                 self.config.kv_return_max_tokens
                 * self.compatibility.kv_bytes_per_token
             ),
-            handle_timeout_ms=self.config.kv_return_handle_timeout_ms,
+            deadline_ms=self.config.kv_return_deadline_ms,
         )
         if not _wire_compatible_ticket(ticket):
             return KVReturnResult(KVReturnStatus.INCOMPATIBLE)
-        expires_at = self._clock() + ticket.handle_timeout_ms / 1000.0
+        expires_at = self._clock() + ticket.deadline_ms / 1000.0
         self._attempts[nonce] = _Attempt(ticket, prompt, expires_at)
         return KVReturnResult(
             KVReturnStatus.ISSUED,
@@ -258,7 +242,8 @@ class KVReturnManager:
 
     def prepare(self, prepare: KVReturnPrepare) -> KVReturnResult:
         """Validate controls and reserve capacity before any transfer."""
-        self.expire()
+        now = self._clock()
+        self.expire(now)
         nonce = prepare.ticket.nonce
         terminal = self._terminal.get(nonce)
         if terminal is not None:
@@ -272,7 +257,6 @@ class KVReturnManager:
                 assert reservation is not None
                 return KVReturnResult(
                     KVReturnStatus.PREPARED,
-                    transfer_ticket=attempt.transfer_ticket,
                     reserved_blocks=reservation.reserved_blocks,
                     idempotent=True,
                 )
@@ -280,7 +264,7 @@ class KVReturnManager:
                 attempt,
                 KVReturnStatus.INCOMPATIBLE,
             )
-        if not self._valid_prepare(attempt, prepare):
+        if not self._valid_prepare(attempt, prepare, now):
             return self._finish(
                 attempt, KVReturnStatus.INCOMPATIBLE,
                 prepare=prepare,
@@ -309,19 +293,9 @@ class KVReturnManager:
                 prepare=prepare,
             )
         attempt.prepare = prepare
-        attempt.transfer_ticket = KVReturnTransferTicket(
-            nonce=secrets.token_urlsafe(24),
-            handle_nonce=attempt.ticket.nonce,
-            attempt_id=attempt.ticket.attempt_id,
-            deadline_ms=self.config.kv_return_deadline_ms,
-        )
-        attempt.expires_at = (
-            self._clock() + attempt.transfer_ticket.deadline_ms / 1000.0
-        )
         attempt.reservation = reservation
         return KVReturnResult(
             KVReturnStatus.PREPARED,
-            transfer_ticket=attempt.transfer_ticket,
             reserved_blocks=reservation.reserved_blocks,
         )
 
@@ -329,7 +303,8 @@ class KVReturnManager:
         """Validate a prepared attempt and atomically import its token tail."""
         prepare = commit.prepare
         nonce = prepare.ticket.nonce
-        self.expire()
+        now = self._clock()
+        self.expire(now)
         terminal = self._terminal.get(nonce)
         if terminal is not None:
             return self._terminal_result(terminal, prepare=prepare, commit=commit)
@@ -341,19 +316,13 @@ class KVReturnManager:
                 attempt,
                 (
                     KVReturnStatus.NOT_PREPARED
-                    if self._valid_prepare(attempt, prepare)
+                    if self._valid_prepare(attempt, prepare, now)
                     else KVReturnStatus.INCOMPATIBLE
                 ),
                 prepare=prepare,
                 commit=commit,
             )
         if prepare != attempt.prepare:
-            return self._finish(
-                attempt,
-                KVReturnStatus.INCOMPATIBLE,
-                commit=commit,
-            )
-        if commit.transfer_ticket != attempt.transfer_ticket:
             return self._finish(
                 attempt,
                 KVReturnStatus.INCOMPATIBLE,
@@ -416,19 +385,19 @@ class KVReturnManager:
             )
         return self._finish(attempt, KVReturnStatus.ABORTED)
 
-    def expire(self) -> int:
+    def expire(self, now: Optional[float] = None) -> int:
         """Expire active attempts and purge bounded idempotency records."""
-        now = self._clock()
-        self._purge_terminals(now)
+        current = self._clock() if now is None else now
+        self._purge_terminals(current)
         expired = [
             attempt for attempt in self._attempts.values()
-            if now >= attempt.expires_at
+            if current >= attempt.expires_at
         ]
         for attempt in sorted(expired, key=lambda item: (item.expires_at, item.ticket.nonce)):
             self._finish(
                 attempt,
                 KVReturnStatus.EXPIRED,
-                now=now,
+                now=current,
             )
         return len(expired)
 
@@ -459,7 +428,12 @@ class KVReturnManager:
         self._terminal.pop(ticket.nonce, None)
         return True
 
-    def _valid_prepare(self, attempt: _Attempt, prepare: KVReturnPrepare) -> bool:
+    def _valid_prepare(
+        self,
+        attempt: _Attempt,
+        prepare: KVReturnPrepare,
+        now: float,
+    ) -> bool:
         ticket = prepare.ticket
         count = prepare.generated_token_count
         valid_count = (
@@ -482,6 +456,7 @@ class KVReturnManager:
             and prepare.claimed_payload_bytes == expected_bytes
             and expected_bytes <= ticket.max_payload_bytes
             and _valid_checksum(prepare.token_ids_checksum)
+            and now < attempt.expires_at
         )
 
     def _finish(
@@ -489,10 +464,10 @@ class KVReturnManager:
         attempt: _Attempt,
         status: KVReturnStatus,
         *,
-        prepare: KVReturnPrepare | None = None,
-        commit: KVReturnCommit | None = None,
+        prepare: Optional[KVReturnPrepare] = None,
+        commit: Optional[KVReturnCommit] = None,
         release: bool = True,
-        now: float | None = None,
+        now: Optional[float] = None,
     ) -> KVReturnResult:
         self._attempts.pop(attempt.ticket.nonce, None)
         if release and attempt.reservation is not None:
@@ -516,9 +491,9 @@ class KVReturnManager:
     def _terminal_result(
         terminal: _Terminal,
         *,
-        prepare: KVReturnPrepare | None = None,
-        commit: KVReturnCommit | None = None,
-        abort: KVReturnAbort | None = None,
+        prepare: Optional[KVReturnPrepare] = None,
+        commit: Optional[KVReturnCommit] = None,
+        abort: Optional[KVReturnAbort] = None,
     ) -> KVReturnResult:
         ticket_matches = (
             prepare is not None
@@ -682,7 +657,7 @@ def _wire_compatible_ticket(ticket: KVReturnTicket) -> bool:
         )
         and _valid_wire_integer(ticket.max_generated_tokens, minimum=1)
         and _valid_wire_integer(ticket.max_payload_bytes, minimum=1)
-        and _valid_wire_number(ticket.handle_timeout_ms, positive=True)
+        and _valid_wire_number(ticket.deadline_ms, positive=True)
     )
 
 
