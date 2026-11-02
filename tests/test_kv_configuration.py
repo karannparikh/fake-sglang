@@ -28,6 +28,13 @@ def test_invalid_generation_delay_fails(server_args, value):
         ))
 
 
+def test_invalid_timing_profile_fails(server_args):
+    with pytest.raises(ValueError, match="fake_timing_profile"):
+        SimConfig.from_server_args(server_args(
+            fake_timing_profile="unknown",
+        ))
+
+
 @pytest.mark.parametrize("capacity", [8, 17])
 def test_token_capacity_requires_whole_blocks(server_args, capacity):
     with pytest.raises(ValueError, match="multiple of page_size"):
