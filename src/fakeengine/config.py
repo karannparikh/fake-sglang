@@ -21,6 +21,8 @@ class SimConfig:
     model_path: str
     served_model_name: str
     disaggregation_mode: str        # null | prefill | decode
+    timing_profile: str             # analytic | h200
+    timing_seed: int
     vocab_size: int
     context_len: int
     kv_bytes_per_token: int
@@ -145,6 +147,22 @@ class SimConfig:
 
         enable_kv_return = bool(getattr(server_args, "enable_kv_return", False))
         disaggregation_mode = server_args.disaggregation_mode or "null"
+        timing_profile = getattr(server_args, "fake_timing_profile", "analytic")
+        if timing_profile not in {"analytic", "h200"}:
+            raise ValueError("fake_timing_profile must be analytic or h200")
+        if timing_profile == "h200" and disaggregation_mode not in {
+            "prefill",
+            "decode",
+        }:
+            raise ValueError(
+                "fake_timing_profile=h200 requires disaggregation_mode "
+                "prefill or decode"
+            )
+        timing_seed = getattr(server_args, "fake_timing_seed", None)
+        if timing_seed is None:
+            timing_seed = server_args.random_seed
+        if isinstance(timing_seed, bool) or not isinstance(timing_seed, int):
+            raise ValueError("fake_timing_seed must be an integer")
         prefix_caching = not bool(getattr(server_args, "disable_radix_cache", False))
         # Mirror ``KVSender._return_ticket``: the reverse path only produces a
         # ticket on prefill workers with radix caching enabled. Any other
@@ -244,6 +262,8 @@ class SimConfig:
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
             disaggregation_mode=disaggregation_mode,
+            timing_profile=timing_profile,
+            timing_seed=timing_seed,
             vocab_size=model_config.vocab_size,
             context_len=model_config.context_len,
             kv_bytes_per_token=kv_bytes_per_token,
@@ -307,7 +327,7 @@ def announce(config: SimConfig) -> None:
         "fake-sglang: SIMULATED engine -- no model weights, no real inference. "
         "mode=%s model=%s vocab=%d kv=%d blocks x %d tok "
         "(%.1f KiB/token) prefill=%.1fms/1k kv-generation=%.1fms/1k "
-        "itl=%.1fms xfer=%s speedup=%.2fx "
+        "timing=%s seed=%d itl=%.1fms xfer=%s speedup=%.2fx "
         "output-len=%s output-token=%s location=%s",
         config.disaggregation_mode,
         config.served_model_name,
@@ -317,6 +337,8 @@ def announce(config: SimConfig) -> None:
         config.kv_bytes_per_token / 1024,
         config.prefill_ms_per_1k,
         config.kv_generation_ms_per_1k,
+        config.timing_profile,
+        config.timing_seed,
         config.itl_ms,
         "per-link topology"
         if config.topology is not None

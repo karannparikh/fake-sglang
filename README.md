@@ -307,6 +307,8 @@ instead of adding the aggregated workers to the decode pool.
 
 | Flag | Default | Effect |
 |---|---|---|
+| `--fake-timing-profile` | `analytic` | Use the overrideable analytic model, or opt into sampled `h200` disaggregated timing |
+| `--fake-timing-seed` | `--random-seed` | Seed for reproducible sampled timing; packed DP ranks use distinct deterministic streams |
 | `--fake-prefill-ms-per-1k-tokens` | 55.0 | Prefill cost per 1k recomputed tokens |
 | `--fake-prefill-overhead-ms` | 4.0 | Fixed per-prefill-step cost |
 | `--fake-kv-generation-ms-per-1k-tokens` | 0.0 | Additional K/V-generation cost for uncached prefill tokens |
@@ -332,6 +334,47 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-output-token-id` | unset | Emit one deterministic token ID for every generated token; useful for tokenizer round-trip-safe KV-return benchmarks |
 | `--fake-location` | unset | This worker's place in the network, e.g. `region-a/cluster-1/zone-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
+
+The default `analytic` profile is unchanged and remains fully controlled by
+the prefill and ITL flags above. The opt-in `h200` profile is available only
+for disaggregated prefill and decode workers. It samples the measured H200
+engine-only P50, P90, P95, and P99 values instead of turning P50 into a
+deterministic curve. The analytic prefill and ITL flags do not shift sampled
+H200 values; select `analytic` when manually overriding those costs.
+
+For each step, the simulator first linearly interpolates all four quantiles
+across the relevant workload dimension: active batch size for decode and
+recomputed context tokens for prefill. Values outside the measured workload
+range clamp to the nearest bucket. It then samples a percentile from the
+seeded stream and linearly interpolates the inverse CDF. The unreported
+P0-P50 and P99-P100 edges extend the adjacent measured segment, with latency
+clamped at zero. Identical seeds and workloads reproduce the same sequence;
+packed DP ranks offset the seed by rank.
+
+| H200 decode batch | Engine latency P50 / P90 / P95 / P99 (ms) |
+|---:|---:|
+| 1 | 3.6 / 6.2 / 7.0 / 8.4 |
+| 2 | 4.1 / 7.2 / 7.8 / 8.7 |
+| 4 | 6.2 / 8.0 / 8.5 / 9.7 |
+| 8 | 7.5 / 8.8 / 9.3 / 11.7 |
+| 16 | 8.6 / 10.0 / 10.4 / 12.0 |
+| 24 | 9.8 / 11.0 / 11.4 / 12.9 |
+| 32 | 10.4 / 12.0 / 12.7 / 14.8 |
+
+| H200 prefill context bucket | Engine latency P50 / P90 / P95 / P99 (s) |
+|---:|---:|
+| 16K-32K | 0.26 / 2.0 / 5.0 / 17 |
+| 32K-64K | 1.05 / 3.0 / 5.4 / 16 |
+| 64K-128K | 2.45 / 5.3 / 6.8 / 21 |
+| 128K-256K | 6.5 / 14.8 / 22 / 57 |
+| 256K+ | 19 / 46 / 73 / 124 |
+
+The source did not report engine-only prefill quantiles below 16K, so those
+contexts clamp to the 16K-32K bucket rather than mixing in end-to-end TTFT
+measurements. Prefill interruptions and queueing continue to emerge from the
+scheduler instead of being added to every sampled engine step. A follow-up
+will consolidate this timing profile with the existing H200 capacity, context,
+and KV defaults under one hardware-profile configuration.
 
 Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots. The
 default `--page-size` is 256 and the default `--context-length` is 1,048,576.
