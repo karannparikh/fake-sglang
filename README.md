@@ -363,14 +363,17 @@ packed DP ranks offset the seed by rank.
 
 | H200 prefill context bucket | Engine latency P50 / P90 / P95 / P99 (s) |
 |---:|---:|
+| Derived 8K scheduler step | 0.13 / 1.0 / 2.5 / 8.5 |
 | 16K-32K | 0.26 / 2.0 / 5.0 / 17 |
 | 32K-64K | 1.05 / 3.0 / 5.4 / 16 |
 | 64K-128K | 2.45 / 5.3 / 6.8 / 21 |
 | 128K-256K | 6.5 / 14.8 / 22 / 57 |
 | 256K+ | 19 / 46 / 73 / 124 |
 
-The source did not report engine-only prefill quantiles below 16K, so those
-contexts clamp to the 16K-32K bucket rather than mixing in end-to-end TTFT
+The source did not report engine-only prefill quantiles below 16K. The
+simulator derives its 8K scheduler-step anchor as half of the 16K-32K values,
+matching the lab's `--max-prefill-tokens 8192` and default
+`--chunked-prefill-size 8192`, rather than mixing in end-to-end TTFT
 measurements. Prefill interruptions and queueing continue to emerge from the
 scheduler instead of being added to every sampled engine step. A follow-up
 will consolidate this timing profile with the existing H200 capacity, context,

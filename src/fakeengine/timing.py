@@ -28,6 +28,7 @@ _H200_DECODE_ENGINE_MS = (
 # The workload coordinates are the representative midpoints used by the source
 # context buckets. The source has no engine-only observations below 16K.
 _H200_PREFILL_ENGINE_MS = (
+    (8_192, (130.0, 1_000.0, 2_500.0, 8_500.0)),
     (24_576, (260.0, 2_000.0, 5_000.0, 17_000.0)),
     (49_152, (1_050.0, 3_000.0, 5_400.0, 16_000.0)),
     (98_304, (2_450.0, 5_300.0, 6_800.0, 21_000.0)),

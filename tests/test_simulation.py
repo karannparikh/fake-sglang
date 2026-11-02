@@ -185,8 +185,28 @@ def test_h200_prefill_clamps_outside_measured_contexts(server_args):
         rng=_FixedRandom(0.50),
     )
 
-    assert short.prefill_ms(1_024) == pytest.approx(260.0)
+    assert short.prefill_ms(1_024) == pytest.approx(130.0)
     assert long.prefill_ms(1_000_000) == pytest.approx(19_000.0)
+
+
+@pytest.mark.parametrize(
+    ("percentile", "expected_ms"),
+    [(0.50, 130.0), (0.90, 1_000.0), (0.95, 2_500.0), (0.99, 8_500.0)],
+)
+def test_h200_prefill_8k_step_uses_half_of_16k_to_32k_profile(
+    server_args,
+    percentile,
+    expected_ms,
+):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(percentile),
+    )
+    assert timing.prefill_ms(8_192) == pytest.approx(expected_ms)
 
 
 def test_h200_timing_seed_reproduces_sample_sequence(server_args):
