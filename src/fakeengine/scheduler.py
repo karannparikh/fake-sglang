@@ -1128,6 +1128,8 @@ class Scheduler:
         return request.stop_after is not None and len(request.generated) >= request.stop_after
 
     def _next_token(self, request: Request) -> int:
+        if self.config.output_token_id is not None:
+            return self.config.output_token_id
         if request._stream is None:                       # noqa: SLF001
             request._stream = token_gen.token_stream(     # noqa: SLF001
                 request.prompt_ids, self.config.vocab_size
