@@ -57,7 +57,9 @@ def test_zero_sigma_gives_exactly_the_median():
 
 
 def test_output_length_is_off_by_default(server_args):
-    assert _config(server_args).output_len_median is None
+    config = _config(server_args)
+    assert config.output_len_median is None
+    assert config.output_token_id is None
 
 
 @pytest.mark.parametrize(
@@ -80,6 +82,23 @@ async def test_unset_median_runs_to_max_new_tokens(server_args):
     tokens, reason = await _run(scheduler, Request("r", PROMPT, 20))
     assert (len(tokens), reason) == (20, "length")
     await scheduler.stop()
+
+
+async def test_fixed_output_token_repeats_to_max_new_tokens(server_args):
+    config = _config(server_args, fake_output_token_id=264)
+    scheduler = Scheduler(config)
+    scheduler.start()
+    tokens, reason = await _run(scheduler, Request("r", PROMPT, 20))
+    assert config.output_token_id == 264
+    assert tokens == [264] * 20
+    assert reason == "length"
+    await scheduler.stop()
+
+
+@pytest.mark.parametrize("value", [-1, 32000, True, 1.5])
+def test_invalid_fixed_output_token_fails_at_startup(server_args, value):
+    with pytest.raises(ValueError, match="fake_output_token_id"):
+        _config(server_args, fake_output_token_id=value)
 
 
 async def test_request_stops_at_its_natural_length(server_args):
@@ -157,7 +176,11 @@ async def test_preemption_keeps_the_natural_length(server_args):
 async def test_disaggregated_answer_stops_where_the_aggregated_one_does(
     server_args, unused_port
 ):
-    knobs = dict(fake_output_len_median=40, fake_output_len_sigma=1.0)
+    knobs = dict(
+        fake_output_len_median=40,
+        fake_output_len_sigma=1.0,
+        fake_output_token_id=264,
+    )
     aggregated = Engine(server_args=server_args(**knobs))
     prefill = Engine(server_args=server_args(
         disaggregation_mode="prefill", disaggregation_bootstrap_port=unused_port, **knobs
@@ -186,6 +209,7 @@ async def test_disaggregated_answer_stops_where_the_aggregated_one_does(
         assert agg_meta["finish_reason"] == {"type": "stop", "matched": None}
         assert disagg_meta["finish_reason"] == agg_meta["finish_reason"]
         assert disagg_tokens == agg_tokens
+        assert set(agg_tokens) == {264}
         assert len(agg_tokens) == token_gen.natural_length(PROMPT, 40, 1.0)
     finally:
         for engine in (aggregated, prefill, decode):

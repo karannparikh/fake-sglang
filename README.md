@@ -329,6 +329,7 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
 | `--fake-output-len-median` | unset | Median natural answer length in tokens; unset = every request runs to `max_new_tokens` |
 | `--fake-output-len-sigma` | 1.0 | Lognormal shape of the natural answer length |
+| `--fake-output-token-id` | unset | Emit one deterministic token ID for every generated token; useful for tokenizer round-trip-safe KV-return benchmarks |
 | `--fake-location` | unset | This worker's place in the network, e.g. `region-a/cluster-1/zone-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
 
@@ -356,6 +357,11 @@ that reaches its natural length finishes with `stop`, the way a real answer
 ends on EOS. One that hits `max_new_tokens` first still finishes with
 `length`. `ignore_eos` turns the natural length off for that request, and
 `min_new_tokens` is a floor under it, as in SGLang.
+
+Set `--fake-output-token-id` to replace the deterministic pseudo-random token
+stream with one repeated in-vocabulary token. The caller is responsible for
+choosing a token that survives decode/re-tokenization for the selected
+tokenizer; token `264` is used by the Qwen3 KV-return lab.
 
 KV return limits, deadlines, bandwidth and byte-size overrides must be finite
 and positive; token limits and byte sizes must also be integers. Transfer
