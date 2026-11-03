@@ -167,7 +167,9 @@ def test_h200_prefill_interpolates_each_quantile_by_context(server_args):
     assert timing.prefill_ms(36_864) == pytest.approx(655.0)
 
 
-def test_h200_prefill_clamps_outside_measured_contexts(server_args):
+def test_h200_prefill_prorates_below_and_clamps_above_profile_anchors(
+    server_args,
+):
     short = TimingModel(
         _config(
             server_args,
@@ -185,8 +187,31 @@ def test_h200_prefill_clamps_outside_measured_contexts(server_args):
         rng=_FixedRandom(0.50),
     )
 
-    assert short.prefill_ms(1_024) == pytest.approx(130.0)
+    assert short.prefill_ms(0) == 0
+    assert short.prefill_ms(1_024) == pytest.approx(19.75)
     assert long.prefill_ms(1_000_000) == pytest.approx(19_000.0)
+
+
+@pytest.mark.parametrize(
+    ("percentile", "sampled_8k_ms"),
+    [(0.50, 130.0), (0.90, 1_000.0), (0.95, 2_500.0), (0.99, 8_500.0)],
+)
+def test_h200_prefill_prorates_each_sampled_quantile_below_8k(
+    server_args,
+    percentile,
+    sampled_8k_ms,
+):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(percentile),
+    )
+    overhead_ms = timing.config.prefill_overhead_ms
+    expected_ms = overhead_ms + 0.5 * (sampled_8k_ms - overhead_ms)
+    assert timing.prefill_ms(4_096) == pytest.approx(expected_ms)
 
 
 @pytest.mark.parametrize(

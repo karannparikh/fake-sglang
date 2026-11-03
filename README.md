@@ -373,10 +373,12 @@ packed DP ranks offset the seed by rank.
 The H200 profile derives its 8K scheduler-step anchor as half of the 16K-32K
 values. This matches the lab's `--max-prefill-tokens 8192` and default
 `--chunked-prefill-size 8192` without mixing in end-to-end TTFT measurements.
-Prefill interruptions and queueing continue to emerge from the scheduler
-instead of being added to every sampled engine step. A follow-up will
-consolidate this timing profile with the existing H200 capacity, context, and
-KV defaults under one hardware-profile configuration.
+Steps below 8K prorate the sampled latency by their actual token count while
+preserving the fixed prefill overhead; a zero-compute cache hit therefore adds
+no prefill delay. Prefill interruptions and queueing continue to emerge from
+the scheduler instead of being added to every sampled engine step. A follow-up
+will consolidate this timing profile with the existing H200 capacity, context,
+and KV defaults under one hardware-profile configuration.
 
 Capacity is `fake_num_kv_blocks * page_size * dcp_size` token slots. The
 default `--page-size` is 256 and the default `--context-length` is 1,048,576.

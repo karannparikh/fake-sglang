@@ -56,11 +56,21 @@ class TimingModel:
     def prefill_ms(self, num_tokens: int) -> float:
         cfg = self.config
         if cfg.timing_profile == "h200":
+            num_tokens = max(int(num_tokens), 0)
+            if num_tokens == 0:
+                return 0.0
             sampled = _sample_profile_ms(
                 _H200_PREFILL_ENGINE_MS,
-                max(int(num_tokens), 0),
+                num_tokens,
                 self._rng.random(),
             )
+            first_workload = _H200_PREFILL_ENGINE_MS[0][0]
+            if num_tokens < first_workload:
+                ratio = num_tokens / first_workload
+                sampled = (
+                    cfg.prefill_overhead_ms
+                    + ratio * (sampled - cfg.prefill_overhead_ms)
+                )
             return sampled + self.kv_generation_ms(num_tokens)
         return (
             cfg.prefill_overhead_ms
