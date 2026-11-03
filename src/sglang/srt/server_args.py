@@ -121,6 +121,8 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("debug_tensor_dump_input_file", "str", None, None),
     ("hicache_storage_backend", "str", None, None),
     # --- fake-engine simulation knobs (not present in real SGLang) ---
+    ("fake_timing_profile", "str", "analytic", ("analytic", "h200")),
+    ("fake_timing_seed", "int", None, None),
     ("fake_prefill_ms_per_1k_tokens", "float", 55.0, None),
     ("fake_prefill_overhead_ms", "float", 4.0, None),
     ("fake_kv_generation_ms_per_1k_tokens", "float", 0.0, None),

@@ -306,7 +306,7 @@ class Scheduler:
     ) -> None:
         self.config = config
         self.dp_rank = dp_rank
-        self.timing = TimingModel(config)
+        self.timing = TimingModel(config, seed_offset=dp_rank)
         # The emitter is wired into the pool itself so an eviction cannot
         # happen without the router hearing about it, whichever code path
         # triggered it.

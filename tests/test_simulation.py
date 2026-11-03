@@ -95,6 +95,179 @@ def test_decode_step_degrades_with_batch_size(server_args):
     assert timing.decode_step_ms(8) > timing.decode_step_ms(1)
 
 
+class _FixedRandom:
+    def __init__(self, value):
+        self.value = value
+
+    def random(self):
+        return self.value
+
+
+@pytest.mark.parametrize(
+    ("percentile", "expected_ms"),
+    [(0.50, 3.6), (0.90, 6.2), (0.95, 7.0), (0.99, 8.4)],
+)
+def test_h200_decode_samples_reported_quantiles(
+    server_args,
+    percentile,
+    expected_ms,
+):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="decode",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(percentile),
+    )
+    assert timing.decode_step_ms(1) == pytest.approx(expected_ms)
+
+
+def test_h200_decode_interpolates_each_quantile_by_batch_size(server_args):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="decode",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(0.50),
+    )
+    assert timing.decode_step_ms(3) == pytest.approx(5.15)
+
+
+@pytest.mark.parametrize(
+    ("percentile", "expected_ms"),
+    [(0.0, 0.35), (1.0, 8.75)],
+)
+def test_h200_decode_extrapolates_distribution_edges(
+    server_args,
+    percentile,
+    expected_ms,
+):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="decode",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(percentile),
+    )
+    assert timing.decode_step_ms(1) == pytest.approx(expected_ms)
+
+
+def test_h200_prefill_interpolates_each_quantile_by_context(server_args):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(0.50),
+    )
+    assert timing.prefill_ms(36_864) == pytest.approx(655.0)
+
+
+def test_h200_prefill_prorates_below_and_clamps_above_profile_anchors(
+    server_args,
+):
+    short = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(0.50),
+    )
+    long = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(0.50),
+    )
+
+    assert short.prefill_ms(0) == 0
+    assert short.prefill_ms(1_024) == pytest.approx(19.75)
+    assert long.prefill_ms(1_000_000) == pytest.approx(19_000.0)
+
+
+@pytest.mark.parametrize(
+    ("percentile", "sampled_8k_ms"),
+    [(0.50, 130.0), (0.90, 1_000.0), (0.95, 2_500.0), (0.99, 8_500.0)],
+)
+def test_h200_prefill_prorates_each_sampled_quantile_below_8k(
+    server_args,
+    percentile,
+    sampled_8k_ms,
+):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(percentile),
+    )
+    overhead_ms = timing.config.prefill_overhead_ms
+    expected_ms = overhead_ms + 0.5 * (sampled_8k_ms - overhead_ms)
+    assert timing.prefill_ms(4_096) == pytest.approx(expected_ms)
+
+
+@pytest.mark.parametrize(
+    ("percentile", "expected_ms"),
+    [(0.50, 130.0), (0.90, 1_000.0), (0.95, 2_500.0), (0.99, 8_500.0)],
+)
+def test_h200_prefill_8k_step_uses_half_of_16k_to_32k_profile(
+    server_args,
+    percentile,
+    expected_ms,
+):
+    timing = TimingModel(
+        _config(
+            server_args,
+            disaggregation_mode="prefill",
+            fake_timing_profile="h200",
+        ),
+        rng=_FixedRandom(percentile),
+    )
+    assert timing.prefill_ms(8_192) == pytest.approx(expected_ms)
+
+
+def test_h200_timing_seed_reproduces_sample_sequence(server_args):
+    config = _config(
+        server_args,
+        disaggregation_mode="decode",
+        fake_timing_profile="h200",
+        fake_timing_seed=17,
+    )
+    first = TimingModel(config)
+    second = TimingModel(config)
+
+    assert [first.decode_step_ms(8) for _ in range(6)] == [
+        second.decode_step_ms(8) for _ in range(6)
+    ]
+
+
+def test_h200_timing_seed_changes_sample_sequence(server_args):
+    first = TimingModel(_config(
+        server_args,
+        disaggregation_mode="decode",
+        fake_timing_profile="h200",
+        fake_timing_seed=17,
+    ))
+    second = TimingModel(_config(
+        server_args,
+        disaggregation_mode="decode",
+        fake_timing_profile="h200",
+        fake_timing_seed=18,
+    ))
+
+    assert [first.decode_step_ms(8) for _ in range(3)] != [
+        second.decode_step_ms(8) for _ in range(3)
+    ]
+
+
 def test_transfer_time_is_inversely_proportional_to_bandwidth(server_args):
     fast = TimingModel(_config(server_args, fake_kv_bandwidth_gb_s=64.0))
     slow = TimingModel(_config(server_args, fake_kv_bandwidth_gb_s=8.0))

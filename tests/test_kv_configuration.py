@@ -28,6 +28,27 @@ def test_invalid_generation_delay_fails(server_args, value):
         ))
 
 
+def test_invalid_timing_profile_fails(server_args):
+    with pytest.raises(ValueError, match="fake_timing_profile"):
+        SimConfig.from_server_args(server_args(fake_timing_profile="unknown"))
+
+
+def test_h200_timing_profile_requires_disaggregated_worker(server_args):
+    with pytest.raises(ValueError, match="requires disaggregation_mode"):
+        SimConfig.from_server_args(server_args(fake_timing_profile="h200"))
+
+
+def test_timing_seed_defaults_to_server_random_seed(server_args):
+    config = SimConfig.from_server_args(server_args(random_seed=27))
+    assert config.timing_seed == 27
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "7"])
+def test_invalid_timing_seed_fails(server_args, value):
+    with pytest.raises(ValueError, match="fake_timing_seed"):
+        SimConfig.from_server_args(server_args(fake_timing_seed=value))
+
+
 @pytest.mark.parametrize("capacity", [8, 17])
 def test_token_capacity_requires_whole_blocks(server_args, capacity):
     with pytest.raises(ValueError, match="multiple of page_size"):
