@@ -133,6 +133,10 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     ("fake_kv_return_bytes_per_token", "int", None, None),
     ("fake_kv_return_bandwidth_gb_s", "float", None, None),
     ("fake_kv_return_overhead_ms", "float", None, None),
+    ("fake_kv_return_retention_max_leases", "int", 32, None),
+    ("fake_kv_return_retention_max_blocks", "int", None, None),
+    ("fake_kv_return_retention_max_bytes", "int", None, None),
+    ("fake_kv_return_retention_timeout_ms", "float", None, None),
     ("fake_speedup_ratio", "float", 1.0, None),
     ("fake_num_kv_blocks", "int", 15_509, None),
     ("fake_bootstrap_poll_interval_ms", "float", 5.0, None),
@@ -140,6 +144,8 @@ _SPEC: tuple[tuple[str, str, Any, Optional[Iterable[str]]], ...] = (
     # Natural output length: unset = every request runs to max_new_tokens.
     ("fake_output_len_median", "float", None, None),
     ("fake_output_len_sigma", "float", 1.0, None),
+    # Optional deterministic token for tokenizer round-trip-safe benchmarks.
+    ("fake_output_token_id", "int", None, None),
     # Network placement: this worker's location path and the deployment-wide link
     # table (JSON, see fakeengine/topology.py). Both unset = one global link.
     ("fake_location", "str", None, None),

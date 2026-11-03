@@ -33,6 +33,9 @@ SGLang and never knows the difference.
   the prefill and decode workers, with the payload cost simulated as
   `tokens x kv_bytes_per_token / bandwidth`. `kv_bytes_per_token` is derived
   from the model's real `config.json`.
+- **Response-KV return** — an optional, best-effort background
+  prepare/transfer/commit from decode back to the original prefill DP rank,
+  retaining only the completed response tail while the attempt is active.
 - **KV events** — block stores and evictions published over ZMQ in SGLang's
   exact wire format, so Dynamo's KV-aware router builds a real prefix tree and
   routes on cache hits.
@@ -68,6 +71,12 @@ Scheduler metrics also report the cumulative observed token hit rate.
 uncached-prefill K/V-generation time after speedup scaling, excluding no-peer
 warmups. Recomputed tokens after preemption incur generation time again,
 without counting another cache observation.
+
+Enabled response return adds bounded `sglang:simulated_kv_return_` metrics for
+accepted attempts, stored responses, rejected and failed attempts by stable
+reason, returned tokens/bytes, transfer and commit time, active tasks, and
+retained blocks. The scheduler's KV occupancy and retention lease counters
+remain the source of truth; these metrics only report orchestration outcomes.
 
 `--enable-forward-pass-metrics` requires Dynamo's injected
 `--forward-pass-metrics-ipc-name` and `--forward-pass-metrics-worker-id`.
@@ -305,17 +314,22 @@ instead of adding the aggregated workers to the decode pool.
 | `--fake-itl-ms-per-running-req` | 0.35 | ITL added per extra request in the batch |
 | `--fake-kv-bandwidth-gb-s` | 64.0 | Simulated KV-transfer bandwidth |
 | `--fake-kv-transfer-overhead-ms` | 1.0 | Fixed per-transfer cost |
-| `--enable-kv-return` | false | Advertise version-1 reverse-KV return capability on eligible prefill rooms |
+| `--enable-kv-return` | false | Enable version-1 best-effort response-KV return on eligible prefill and decode workers |
 | `--fake-kv-return-max-tokens` | 4096 | Maximum generated-response tokens an advertised return ticket accepts |
 | `--fake-kv-return-deadline-ms` | bootstrap timeout x 1000 | Return-ticket deadline in milliseconds |
 | `--fake-kv-return-bytes-per-token` | model-derived forward value | Reverse-transfer payload bytes per generated token |
 | `--fake-kv-return-bandwidth-gb-s` | forward KV bandwidth | Reverse-transfer bandwidth override |
 | `--fake-kv-return-overhead-ms` | forward transfer overhead | Fixed reverse-transfer overhead override |
+| `--fake-kv-return-retention-max-leases` | 32 | Maximum completed decode responses whose KV may remain retained |
+| `--fake-kv-return-retention-max-blocks` | all worker blocks | Maximum blocks held by completed-response retention leases |
+| `--fake-kv-return-retention-max-bytes` | retention block budget x block bytes | Maximum KV bytes held by completed-response retention leases |
+| `--fake-kv-return-retention-timeout-ms` | return-ticket deadline | Time before an unreleased completed-response lease expires |
 | `--fake-speedup-ratio` | 1.0 | Divides every simulated sleep (time compression) |
 | `--fake-num-kv-blocks` | 15509 | KV pool size; with the default 256-token page this is 3,970,304 token slots |
 | `--fake-bootstrap-timeout-s` | 30.0 | How long decode waits for prefill's KV |
 | `--fake-output-len-median` | unset | Median natural answer length in tokens; unset = every request runs to `max_new_tokens` |
 | `--fake-output-len-sigma` | 1.0 | Lognormal shape of the natural answer length |
+| `--fake-output-token-id` | unset | Emit one deterministic token ID for every generated token; useful for tokenizer round-trip-safe KV-return benchmarks |
 | `--fake-location` | unset | This worker's place in the network, e.g. `region-a/cluster-1/zone-2` |
 | `--fake-topology` | unset | JSON link table; with locations on both ends it replaces the global KV-transfer bandwidth and overhead |
 
@@ -344,6 +358,11 @@ ends on EOS. One that hits `max_new_tokens` first still finishes with
 `length`. `ignore_eos` turns the natural length off for that request, and
 `min_new_tokens` is a floor under it, as in SGLang.
 
+Set `--fake-output-token-id` to replace the deterministic pseudo-random token
+stream with one repeated in-vocabulary token. The caller is responsible for
+choosing a token that survives decode/re-tokenization for the selected
+tokenizer; token `264` is used by the Qwen3 KV-return lab.
+
 KV return limits, deadlines, bandwidth and byte-size overrides must be finite
 and positive; token limits and byte sizes must also be integers. Transfer
 overheads must be finite and nonnegative, so zero remains valid for both
@@ -353,6 +372,28 @@ back to `bootstrap timeout x 1000`, enabling KV return on an eligible prefill
 room with a zero bootstrap timeout requires an explicit positive
 `--fake-kv-return-deadline-ms`. Unset reverse-transfer overrides inherit the
 existing forward-transfer or model-derived values.
+
+Eligible normal decode completion now uses the existing typed retention lease
+automatically. Eligibility requires decode mode, local `--enable-kv-return`,
+radix caching, a real peer, and a valid server-issued room ticket whose
+compatibility, prefill rank, room, and `cache_salt` match the decode request.
+No ticket is inferred from a request or session ID. For block size `B`, prompt
+length `P`, and generated length `G`, the lease owns block indices
+`floor(P/B)` through `ceil((P+G)/B)-1`; an unaligned prompt therefore retains
+the shared prompt/response boundary block. The original transferred prompt KV
+outside that exact slice is freed at ordinary request completion.
+
+Leases remain visible in ordinary scheduler KV occupancy plus
+`kv_retention_*` scheduler stats until idempotent explicit release, deterministic
+timeout expiry, abort-all, or scheduler shutdown. Scheduling atomically claims
+the lease: generic idle expiry and abort controls cannot free a claimed lease,
+and only its background task can release it. The claim receives a fresh
+`--fake-kv-return-retention-timeout-ms` task deadline, which bounds terminal
+handoff plus prepare/transfer/commit. Count, block, and byte budgets decline
+only the optimization; the completed model response still succeeds. Aborted,
+failed, or disconnected-before-terminal requests never schedule returns.
+Retained prebuilt decode blocks are not inserted into the decode cache and do
+not publish local KV store events.
 
 KV event publishing is enabled with SGLang's own flag, not a `--fake-` one:
 
@@ -386,6 +427,16 @@ frontend --> PrefillRouter --> prefill worker   (max_tokens forced to 1)
                                     -> Success
                     decodes from a "prebuilt" batch, leading with the
                     token prefill actually produced
+                                    |
+                    terminal response is delivered with
+                    kv_return={status: scheduled, num_tokens, kv_bytes}
+                    only when a bounded background slot was accepted
+                                    |
+                    retain exact response-tail lease; asynchronously
+                    prepare -> simulate generated-KV transfer -> commit
+                                    |
+                    original prefill DP rank atomically imports new full
+                    blocks and publishes its normal BlockStored events
 ```
 
 `bootstrap_host == "2.2.2.2"` (SGLang's `FAKE_BOOTSTRAP_HOST`) short-circuits
@@ -393,13 +444,59 @@ the whole handshake. Dynamo's health-check canary and prefill warmup both use
 it; without that path, warmup would block for its 1800 s timeout. Sentinel
 requests never publish `kv_return` metadata.
 
-`--enable-kv-return` is disabled by default. On a real disaggregated prefill
-room with radix caching enabled, it adds a version-1 `kv_return` object with an
-unguessable per-room nonce, the prefill DP rank, the maximum return-token count
-and the deadline. No session ID is used. This first stack layer only negotiates
-that capability: decode does not retain generated KV, transfer it back, import
-it into the prefill scheduler, call prepare/commit endpoints, or start any
-background return task yet.
+`--enable-kv-return` is disabled by default and must be enabled on both
+workers. On a real disaggregated prefill room with radix caching enabled, the
+bootstrap server asks that rank's return manager to issue the `kv_return`
+ticket placed in room metadata. The ticket has an unguessable nonce and
+attempt ID, exact room and prefill DP rank, cache namespace,
+token/byte/deadline limits, and the complete model/KV compatibility contract.
+No session ID is used.
+
+The prefill bootstrap HTTP server exposes the manager lifecycle directly:
+
+```
+POST /kv-return/v1/prepare  -> READY only after clean capacity is reserved
+POST /kv-return/v1/commit   -> atomically imports the validated token tail
+POST /kv-return/v1/abort    -> releases an issued or prepared attempt
+```
+
+Each operation carries the complete ticket and attempt controls. JSON fields
+and types are strict, request and token-array sizes are bounded, and stable
+status/reason bodies distinguish malformed input, missing or expired tickets,
+compatibility mismatch, capacity rejection, checksum/token failure and import
+failure. Exact duplicate requests preserve the manager's idempotent result.
+The existing bootstrap sweeper expires manager attempts; an unclaimed room's
+expiry clears its active or terminal ticket state, and server shutdown releases
+all reservations and idempotency records.
+
+`BootstrapClient` now has strict typed prepare, commit, and abort operations,
+and `fakeengine.kv_return_client.return_generated_kv` can execute one explicit
+prepare -> simulated reverse payload -> commit sequence from the exact
+`kv_return` ticket in room metadata. The helper shares one ticket/client
+deadline across all three phases, uses only generated-response KV bytes, uses
+the decode-to-prefill topology link when both locations are known, and
+best-effort aborts a prepared attempt when transfer or commit fails.
+
+Normal eligible decode completion is connected to that helper without joining
+it to response latency. Before yielding the terminal chunk, Engine validates
+the room ticket, obtains the exact response lease, and accepts the work only
+when the retention count/block/byte budgets and the per-rank background task
+bound allow it. The terminal response reports only `scheduled`; it never
+claims storage success. After terminal delivery, the tracked task starts the
+helper. Immediate next-turn routing may race that task and miss, while a later
+turn can reuse every newly imported full block at the ticket's original
+prefill DP rank.
+
+Prepare rejection, incompatibility, expiry, timeout, cancellation, transport
+or protocol failure, task rejection, and engine shutdown never change an
+already completed model response. Every outcome releases the lease. Shutdown
+cancels and awaits tracked tasks while the HTTP client is still open, allowing
+prepared attempts to be best-effort aborted before schedulers and sockets
+close.
+
+The reverse payload remains simulated; no response tensor bytes move between
+GPUs. Dynamo request schemas, per-request return policy, session affinity,
+decode rerouting, and topology-aware route selection remain out of scope.
 
 ## KV-aware routing
 
@@ -499,8 +596,9 @@ Dynamo a stub `torch`. Any real call into the stub raises an error. Set
 ## Tests
 
 ```bash
-pytest tests/
-pytest ../dynamo/components/src/dynamo/sglang/tests -m unit      # 1006 pass, 7 fail (below)
+python -m ruff check .
+python -m pytest tests/
+python -m pytest ../dynamo/components/src/dynamo/sglang/tests -m unit  # 1006 pass, 7 fail (below)
 ```
 
 Counts are against Dynamo `2db5333ef6`.

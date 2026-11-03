@@ -37,13 +37,17 @@ class SimConfig:
     itl_ms_per_running_req: float
     kv_bandwidth_gb_s: float
     kv_transfer_overhead_ms: float
-    enable_kv_return: bool
-    kv_return_protocol_version: int
-    kv_return_max_tokens: int
-    kv_return_deadline_ms: float
-    kv_return_bytes_per_token: int
-    kv_return_bandwidth_gb_s: float
-    kv_return_overhead_ms: float
+    enable_kv_return: bool  # Advertise reverse-KV return on eligible rooms.
+    kv_return_protocol_version: int  # Version of the return-ticket schema.
+    kv_return_max_tokens: int  # Maximum generated tokens a ticket accepts.
+    kv_return_deadline_ms: float  # Return-ticket deadline in milliseconds.
+    kv_return_bytes_per_token: int  # Reverse payload bytes per generated token.
+    kv_return_bandwidth_gb_s: float  # Simulated reverse-transfer bandwidth.
+    kv_return_overhead_ms: float  # Fixed reverse-transfer cost in milliseconds.
+    kv_return_retention_max_leases: int  # Maximum active decode KV leases.
+    kv_return_retention_max_blocks: int  # Maximum retained decode KV blocks.
+    kv_return_retention_max_bytes: int  # Maximum retained decode KV bytes.
+    kv_return_retention_timeout_ms: float  # Decode KV lease lifetime.
     speedup_ratio: float
 
     bootstrap_host: Optional[str]
@@ -57,6 +61,7 @@ class SimConfig:
     kv_generation_ms_per_1k: float = 0.0
     output_len_median: Optional[float] = None
     output_len_sigma: float = 1.0
+    output_token_id: Optional[int] = None
 
     @property
     def total_kv_tokens(self) -> int:
@@ -100,6 +105,16 @@ class SimConfig:
         output_len_sigma = float(getattr(server_args, "fake_output_len_sigma", 1.0))
         if not math.isfinite(output_len_sigma) or output_len_sigma < 0:
             raise ValueError("fake_output_len_sigma must be finite and nonnegative")
+        output_token_id = getattr(server_args, "fake_output_token_id", None)
+        if output_token_id is not None and (
+            isinstance(output_token_id, bool)
+            or not isinstance(output_token_id, int)
+            or output_token_id < 0
+            or output_token_id >= model_config.vocab_size
+        ):
+            raise ValueError(
+                "fake_output_token_id must be an integer in the model vocabulary"
+            )
 
         max_batched = int(
             server_args.max_prefill_tokens
@@ -188,6 +203,43 @@ class SimConfig:
                 "fake_bootstrap_timeout_s"
             )
 
+        retention_max_leases = _positive_int(
+            getattr(server_args, "fake_kv_return_retention_max_leases", 32),
+            "fake_kv_return_retention_max_leases",
+        )
+        retention_max_blocks = getattr(
+            server_args, "fake_kv_return_retention_max_blocks", None,
+        )
+        if retention_max_blocks is None:
+            retention_max_blocks = num_blocks
+        else:
+            retention_max_blocks = _positive_int(
+                retention_max_blocks,
+                "fake_kv_return_retention_max_blocks",
+            )
+        retention_max_bytes = getattr(
+            server_args, "fake_kv_return_retention_max_bytes", None,
+        )
+        if retention_max_bytes is None:
+            retention_max_bytes = (
+                retention_max_blocks * block_size * kv_bytes_per_token
+            )
+        else:
+            retention_max_bytes = _positive_int(
+                retention_max_bytes,
+                "fake_kv_return_retention_max_bytes",
+            )
+        retention_timeout = getattr(
+            server_args, "fake_kv_return_retention_timeout_ms", None,
+        )
+        if retention_timeout is None:
+            retention_timeout = return_deadline
+        else:
+            retention_timeout = _positive_finite_float(
+                retention_timeout,
+                "fake_kv_return_retention_timeout_ms",
+            )
+
         return cls(
             model_path=server_args.model_path,
             served_model_name=server_args.served_model_name or server_args.model_path,
@@ -220,6 +272,10 @@ class SimConfig:
             kv_return_bytes_per_token=return_bytes,
             kv_return_bandwidth_gb_s=return_bandwidth,
             kv_return_overhead_ms=return_overhead,
+            kv_return_retention_max_leases=retention_max_leases,
+            kv_return_retention_max_blocks=retention_max_blocks,
+            kv_return_retention_max_bytes=retention_max_bytes,
+            kv_return_retention_timeout_ms=retention_timeout,
             speedup_ratio=max(float(server_args.fake_speedup_ratio), 1e-6),
             bootstrap_host=None,
             bootstrap_port=int(server_args.disaggregation_bootstrap_port or 8998),
@@ -233,6 +289,7 @@ class SimConfig:
             topology=topology,
             output_len_median=output_len_median,
             output_len_sigma=output_len_sigma,
+            output_token_id=output_token_id,
         )
 
 
@@ -251,7 +308,7 @@ def announce(config: SimConfig) -> None:
         "mode=%s model=%s vocab=%d kv=%d blocks x %d tok "
         "(%.1f KiB/token) prefill=%.1fms/1k kv-generation=%.1fms/1k "
         "itl=%.1fms xfer=%s speedup=%.2fx "
-        "output-len=%s location=%s",
+        "output-len=%s output-token=%s location=%s",
         config.disaggregation_mode,
         config.served_model_name,
         config.vocab_size,
@@ -269,6 +326,7 @@ def announce(config: SimConfig) -> None:
         if config.output_len_median is None
         else "lognormal(median=%g, sigma=%g)"
         % (config.output_len_median, config.output_len_sigma),
+        config.output_token_id if config.output_token_id is not None else "generated",
         config.location or "-",
     )
 
